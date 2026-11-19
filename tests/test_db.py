@@ -80,6 +80,27 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
         saved = await self.db.get_user_container(789)
         self.assertEqual(saved, record)
 
+    async def test_display_mode_and_message_are_persistent(self) -> None:
+        await self.db.create_user_container(
+            user_id=790,
+            guild_id=2,
+            thread_id=32,
+            container_id="xorg",
+            container_name="discord-alpine-790",
+        )
+
+        await self.db.set_display(
+            790,
+            mode="xorg",
+            terminal_message_id=None,
+            xorg_message_id=999,
+        )
+
+        saved = await self.db.get_user_container(790)
+        self.assertEqual(saved.display_mode, "xorg")  # type: ignore[union-attr]
+        self.assertEqual(saved.xorg_message_id, 999)  # type: ignore[union-attr]
+        self.assertIsNone(saved.terminal_message_id)  # type: ignore[union-attr]
+
 
 class DatabaseMigrationTests(unittest.IsolatedAsyncioTestCase):
     async def test_terminal_columns_are_added_to_old_database(self) -> None:
@@ -115,6 +136,8 @@ class DatabaseMigrationTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(record.terminal_rich_embed, 1)  # type: ignore[union-attr]
             self.assertEqual(record.terminal_refresh_seconds, 3)  # type: ignore[union-attr]
             self.assertIsNone(record.terminal_message_id)  # type: ignore[union-attr]
+            self.assertEqual(record.display_mode, "tty")  # type: ignore[union-attr]
+            self.assertIsNone(record.xorg_message_id)  # type: ignore[union-attr]
             await database.close()
 
 

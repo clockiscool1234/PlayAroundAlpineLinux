@@ -18,6 +18,8 @@ This is an initial implementation designed to be extended as requirements become
   - `/send keys:<sequence>`
   - `/reset`
   - `/refresh`
+  - `/showxorg`
+  - `/showtty`
   - `/printtty`
   - `/status`
   - `/start`
@@ -25,7 +27,7 @@ This is an initial implementation designed to be extended as requirements become
   - `/restart`
   - `/destroycontainer`
 - SQLite settings/ownership persistence and Docker writable-layer data persistence across bot and host reboots.
-- Default Alpine image: `alpine:3.20`.
+- Default Xorg-enabled Alpine image: `playaround-alpine-xorg:3.20`, built locally from Alpine 3.20.
 - 512 MiB memory limit with no additional swap.
 - 1 GiB writable-layer disk quota; creation fails if Docker cannot enforce it.
 - One-CPU execution ceiling.
@@ -49,6 +51,24 @@ Send a normal message in the private control thread to type that text followed b
 - `/refresh` redraws the current TTY message immediately, while `/printtty` deletes old TTY displays and moves the live one to the bottom of the thread.
 - `/reset` clears the rendered screen and sends `reset` to the active TTY.
 - `/restart` restarts the container, kills its current processes, and opens a fresh TTY without deleting its writable filesystem.
+
+### Headless Xorg display
+
+`/showxorg` hides and deletes the Discord TTY message without closing its Docker exec TTY, then starts an `800×600` Xvfb desktop inside the same user container. Xorg input counts as activity for the hidden TTY's idle timer. The Discord message is a rich embed whose image attachment is replaced after input or when **Refresh** is pressed. Xvfb listens only on the container's Unix socket (`:99`); no X11 TCP port is exposed.
+
+The local user image includes Xvfb, Openbox, xterm, xdotool, and ImageMagick. A fresh desktop opens an xterm, and programs started with `DISPLAY=:99` appear in the image. The image includes a visible target drawn at the mouse position because ordinary X11 screenshots omit the pointer.
+
+Xorg controls provide:
+
+- four directional mouse buttons and selectable 100 px, 10 px, or 1 px movement;
+- toggleable left/right mouse-button holds, allowing dragging before toggling the button up again;
+- one-shot Ctrl and Alt modifiers;
+- immediate Esc and Tab keys, combined with queued Ctrl/Alt when selected;
+- **Refresh** and **TTY** buttons.
+
+While Xorg is visible, a normal thread message is typed into the focused X11 window and followed by Enter. If Ctrl or Alt is queued, the modifiers apply to the first ASCII letter/number, remaining text is typed literally, no Enter is appended, and the modifiers clear. `/showtty`, the **TTY** button, or `/printtty` deletes the Xorg image and restores the still-running terminal display.
+
+Screenshots are event-driven rather than video streaming to avoid Discord attachment and edit rate limits. Use **Refresh** for GUI changes that occur without an input event.
 
 Only the container owner can operate its terminal buttons. Discord is not a low-latency transport, but programs such as editors, pagers, and process monitors can retain terminal state and react to input.
 
@@ -179,6 +199,7 @@ Edit `.env` and set `DISCORD_TOKEN`. During development, set `GUILD_ID` to your 
 Start the filtering proxy, then ensure your account can access Docker:
 
 ```bash
+docker compose build user-image
 docker compose up -d network-filter
 docker info
 python run.py
@@ -204,7 +225,7 @@ Compose mounts the host Docker socket so the bot can create sibling containers. 
 |---|---:|---|
 | `DISCORD_TOKEN` | required | Discord bot token |
 | `GUILD_ID` | unset | Test guild for immediate command sync; unset means global sync |
-| `CONTAINER_IMAGE` | `alpine:3.20` | Image for user containers |
+| `CONTAINER_IMAGE` | `playaround-alpine-xorg:3.20` | Locally built Alpine image with headless Xorg tools |
 | `CONTAINER_MEMORY` | `512m` | Docker memory and memory+swap limit |
 | `CONTAINER_DISK` | `1g` | Hard writable-layer quota |
 | `CONTAINER_CPUS` | `1.0` | Maximum CPU cores available to a user container |
@@ -235,6 +256,16 @@ These are creation-time defaults. Changing the file does not overwrite existing 
 docker compose up -d --force-recreate bot
 ```
 
+### User container image
+
+`docker compose up --build -d` builds `user-image/Dockerfile` as `playaround-alpine-xorg:3.20` before the bot starts. For a non-Compose bot process, build it first:
+
+```bash
+docker compose build user-image
+```
+
+Containers created by older versions from plain `alpine:3.20` do not contain the Xorg tools. They continue to work as terminal containers, but `/showxorg` reports the missing tool. Back up their files and recreate them if Xorg access is required; changing `CONTAINER_IMAGE` never silently replaces an existing user's persistent container.
+
 ## Tests
 
 ```bash
@@ -251,9 +282,11 @@ bot/config.py            Environment configuration
 bot/db.py                Async SQLite persistence
 bot/docker_manager.py    Container lifecycle and command execution
 bot/terminal.py          Persistent TTY, ANSI screen renderer, and key input
+bot/xorg.py              Xvfb screenshot renderer and GUI input controls
 bot/cogs/container.py    Discord slash commands and ownership checks
 bot/main.py              Bot startup and command synchronization
 config/user-defaults.toml  Initial per-user terminal settings
+user-image/              Alpine user image with Xvfb/Openbox/xterm
 network-filter/          Squid policy proxy and blocklist generator
 blocklists/              Pinned upstream Git submodules
 tests/                   Unit tests

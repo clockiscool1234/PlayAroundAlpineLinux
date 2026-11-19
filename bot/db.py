@@ -23,6 +23,8 @@ class UserContainer:
     terminal_rich_embed: int = 1
     terminal_refresh_seconds: int = 3
     terminal_message_id: int | None = None
+    display_mode: str = "tty"
+    xorg_message_id: int | None = None
 
 
 class Database:
@@ -65,7 +67,9 @@ class Database:
                 terminal_idle_minutes INTEGER NOT NULL DEFAULT 10,
                 terminal_rich_embed INTEGER NOT NULL DEFAULT 1,
                 terminal_refresh_seconds INTEGER NOT NULL DEFAULT 3,
-                terminal_message_id INTEGER
+                terminal_message_id INTEGER,
+                display_mode TEXT NOT NULL DEFAULT 'tty',
+                xorg_message_id INTEGER
             )
             """
         )
@@ -95,6 +99,13 @@ class Database:
             ),
             "terminal_message_id": (
                 "ALTER TABLE user_containers ADD COLUMN terminal_message_id INTEGER"
+            ),
+            "display_mode": (
+                "ALTER TABLE user_containers "
+                "ADD COLUMN display_mode TEXT NOT NULL DEFAULT 'tty'"
+            ),
+            "xorg_message_id": (
+                "ALTER TABLE user_containers ADD COLUMN xorg_message_id INTEGER"
             ),
         }
         for name, statement in migrations.items():
@@ -225,6 +236,26 @@ class Database:
         await self.db.execute(
             "UPDATE user_containers SET terminal_message_id = ? WHERE user_id = ?",
             (message_id, user_id),
+        )
+        await self.db.commit()
+
+    async def set_display(
+        self,
+        user_id: int,
+        *,
+        mode: str,
+        terminal_message_id: int | None = None,
+        xorg_message_id: int | None = None,
+    ) -> None:
+        if mode not in {"tty", "xorg"}:
+            raise ValueError(f"Unknown display mode: {mode}")
+        await self.db.execute(
+            """
+            UPDATE user_containers
+            SET display_mode = ?, terminal_message_id = ?, xorg_message_id = ?
+            WHERE user_id = ?
+            """,
+            (mode, terminal_message_id, xorg_message_id, user_id),
         )
         await self.db.commit()
 

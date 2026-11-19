@@ -6,6 +6,8 @@ services:
     depends_on:
       network-filter:
         condition: service_healthy
+      user-image:
+        condition: service_completed_successfully
     networks:
       - egress
     volumes:
@@ -14,6 +16,15 @@ services:
       # Docker access is required to create sibling user containers.
       # This socket grants the bot host-level Docker control; protect the bot token.
       - /var/run/docker.sock:/var/run/docker.sock
+
+  # Build the image used for persistent user containers, then exit. The image
+  # remains in the host Docker daemon for the bot's sibling containers.
+  user-image:
+    build: ./user-image
+    image: playaround-alpine-xorg:3.20
+    command: ["/bin/true"]
+    restart: "no"
+    network_mode: none
 
   network-filter:
     build: ./network-filter

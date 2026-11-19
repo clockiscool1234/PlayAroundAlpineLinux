@@ -123,7 +123,7 @@ class DockerManager:
         return await asyncio.to_thread(_create)
 
     def _container_environment(self) -> dict[str, str]:
-        environment = {"TERM": "xterm"}
+        environment = {"TERM": "xterm", "DISPLAY": ":99"}
         if self.http_proxy:
             environment.update(
                 {
@@ -223,6 +223,7 @@ class DockerManager:
                 environment={
                     "TERM": "xterm-256color",
                     "HOME": "/root",
+                    "DISPLAY": ":99",
                     "COLUMNS": str(columns),
                     "LINES": str(rows),
                 },
@@ -265,3 +266,122 @@ class DockerManager:
             return container.status
 
         return await asyncio.to_thread(_status)
+
+    async def run_command(
+        self,
+        container_id: str,
+        command: list[str],
+        *,
+        environment: dict[str, str] | None = None,
+        max_output: int = 8 * 1024 * 1024,
+    ) -> bytes:
+        container = await self.get_container(container_id)
+        if container is None:
+            raise RuntimeError("Container not found")
+        await asyncio.to_thread(container.reload)
+        if container.status != "running":
+            raise RuntimeError(f"Container is not running (status: {container.status})")
+
+        def _run() -> bytes:
+            result = container.exec_run(
+                command,
+                environment=environment,
+                demux=False,
+            )
+            output = result.output or b""
+            if isinstance(output, str):
+                output = output.encode("utf-8", errors="replace")
+            if len(output) > max_output:
+                raise RuntimeError(
+                    f"Container command output exceeded {max_output} bytes"
+                )
+            if result.exit_code != 0:
+                detail = output.decode("utf-8", errors="replace").strip()
+                raise RuntimeError(
+                    f"Container command exited with {result.exit_code}"
+                    + (f": {detail[:1000]}" if detail else "")
+                )
+            return output
+
+        return await asyncio.to_thread(_run)
+
+    async def ensure_xorg(self, container_id: str) -> None:
+        script = r"""
+set -eu
+for command in Xvfb xdotool import convert xterm openbox; do
+    if ! command -v "$command" >/dev/null 2>&1; then
+        echo "Missing $command. Recreate this container with the Xorg-enabled user image." >&2
+        exit 127
+    fi
+done
+
+if [ ! -s /tmp/alpine-xvfb.pid ] || ! kill -0 "$(cat /tmp/alpine-xvfb.pid)" 2>/dev/null; then
+    rm -f /tmp/.X99-lock
+    nohup Xvfb :99 -screen 0 800x600x24 -nolisten tcp -ac \
+        </dev/null >/tmp/alpine-xvfb.log 2>&1 &
+    echo $! >/tmp/alpine-xvfb.pid
+fi
+
+ready=0
+for delay in 1 1 1 1 1; do
+    if DISPLAY=:99 xdotool getmouselocation >/dev/null 2>&1; then
+        ready=1
+        break
+    fi
+    sleep "$delay"
+done
+if [ "$ready" -ne 1 ]; then
+    cat /tmp/alpine-xvfb.log >&2 || true
+    exit 1
+fi
+
+# Recover safely if the bot previously stopped while a toggleable button was held.
+DISPLAY=:99 xdotool mouseup 1 >/dev/null 2>&1 || true
+DISPLAY=:99 xdotool mouseup 3 >/dev/null 2>&1 || true
+
+if [ ! -s /tmp/alpine-openbox.pid ] || ! kill -0 "$(cat /tmp/alpine-openbox.pid)" 2>/dev/null; then
+    nohup env DISPLAY=:99 openbox </dev/null >/tmp/alpine-openbox.log 2>&1 &
+    echo $! >/tmp/alpine-openbox.pid
+fi
+
+if ! DISPLAY=:99 xdotool search --class XTerm >/dev/null 2>&1; then
+    nohup env DISPLAY=:99 xterm -geometry 96x32+8+8 \
+        </dev/null >/tmp/alpine-xterm.log 2>&1 &
+fi
+sleep 1
+"""
+        await self.run_command(
+            container_id,
+            ["/bin/sh", "-c", script],
+            max_output=64 * 1024,
+        )
+
+    async def xorg_screenshot(self, container_id: str) -> bytes:
+        # X11 root-window captures omit the cursor. Draw a small red/white
+        # target at xdotool's reported location so Discord users can see it.
+        script = r"""
+set -eu
+eval "$(DISPLAY=:99 xdotool getmouselocation --shell)"
+DISPLAY=:99 import -window root miff:- | \
+    convert miff:- -stroke white -strokewidth 5 -fill none \
+        -draw "circle $X,$Y $((X + 7)),$Y" \
+        -stroke red -strokewidth 2 \
+        -draw "circle $X,$Y $((X + 7)),$Y" png:-
+"""
+        image = await self.run_command(
+            container_id,
+            ["/bin/sh", "-c", script],
+            environment={"DISPLAY": ":99"},
+            max_output=7 * 1024 * 1024,
+        )
+        if not image.startswith(b"\x89PNG\r\n\x1a\n"):
+            raise RuntimeError("Xorg screenshot command did not return a PNG image")
+        return image
+
+    async def xorg_action(self, container_id: str, arguments: list[str]) -> None:
+        await self.run_command(
+            container_id,
+            ["xdotool", *arguments],
+            environment={"DISPLAY": ":99"},
+            max_output=64 * 1024,
+        )

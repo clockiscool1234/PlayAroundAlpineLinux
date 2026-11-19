@@ -148,7 +148,9 @@ class Config:
         return cls(
             discord_token=token,
             guild_id=guild_id,
-            container_image=os.getenv("CONTAINER_IMAGE", "alpine:3.20").strip(),
+            container_image=os.getenv(
+                "CONTAINER_IMAGE", "playaround-alpine-xorg:3.20"
+            ).strip(),
             container_memory=os.getenv("CONTAINER_MEMORY", "512m").strip(),
             container_disk=os.getenv("CONTAINER_DISK", "1g").strip(),
             container_cpus=_get_float("CONTAINER_CPUS", 1.0),

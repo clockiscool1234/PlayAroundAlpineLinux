@@ -58,6 +58,7 @@ class TerminalSession:
         self.write_lock = asyncio.Lock()
         self.message_lock = asyncio.Lock()
         self.alive = False
+        self.visible = True
         self._closing = False
         self._expected_disconnect = False
         self._idle_expired = False
@@ -72,7 +73,32 @@ class TerminalSession:
         self._last_rendered = None
 
     async def refresh(self) -> None:
+        if not self.visible:
+            return
         self._last_rendered = None
+        await self._render()
+
+    async def hide_message(self) -> None:
+        self.visible = False
+        if self.render_task and not self.render_task.done():
+            self.render_task.cancel()
+        self.render_task = None
+        async with self.message_lock:
+            if self.message is not None:
+                try:
+                    await self.message.delete()
+                except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                    pass
+            self.message = None
+            self.record.terminal_message_id = None
+            self._last_rendered = None
+            await self.bot.db.set_terminal_message(self.record.user_id, None)
+
+    async def show_message(self) -> None:
+        self.visible = True
+        self._dirty = False
+        self._last_rendered = None
+        await self._ensure_message()
         await self._render()
 
     async def start(self) -> None:
@@ -225,6 +251,8 @@ class TerminalSession:
 
     def request_render(self) -> None:
         self._dirty = True
+        if not self.visible:
+            return
         if self.render_task is None or self.render_task.done():
             self.render_task = asyncio.create_task(
                 self._render_loop(),
@@ -310,6 +338,8 @@ class TerminalSession:
         )
 
     async def _render(self) -> None:
+        if not self.visible:
+            return
         async with self.message_lock:
             await self._ensure_message()
             fingerprint = self._render_fingerprint()

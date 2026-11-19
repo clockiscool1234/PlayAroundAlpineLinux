@@ -101,6 +101,7 @@ class DockerManagerTests(unittest.IsolatedAsyncioTestCase):
             kwargs["environment"]["HTTPS_PROXY"],
             "http://172.30.0.2:3128",
         )
+        self.assertEqual(kwargs["environment"]["DISPLAY"], ":99")
         self.assertEqual(kwargs["cap_drop"], ["ALL"])
         self.assertEqual(kwargs["security_opt"], ["no-new-privileges:true"])
         self.assertEqual(kwargs["restart_policy"], {"Name": "unless-stopped"})
@@ -118,6 +119,7 @@ class DockerManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(connection.socket.timeout)
         self.assertTrue(client.api.create_kwargs["stdin"])
         self.assertTrue(client.api.create_kwargs["tty"])
+        self.assertEqual(client.api.create_kwargs["environment"]["DISPLAY"], ":99")
         self.assertEqual(client.api.start_kwargs, {"tty": True, "socket": True})
         self.assertEqual(client.api.resize, ("exec-id", 22, 80))
         command = client.api.create_args[1]

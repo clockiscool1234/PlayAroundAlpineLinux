@@ -11,6 +11,7 @@ from discord.ext import commands
 
 from ..db import UserContainer
 from ..terminal import TerminalSession
+from ..xorg import XorgControlView, XorgSession
 
 log = logging.getLogger(__name__)
 
@@ -127,12 +128,16 @@ class ContainerControl(commands.Cog):
         self._creation_locks: dict[int, asyncio.Lock] = {}
         self._session_locks: dict[int, asyncio.Lock] = {}
         self._control_locks: dict[int, asyncio.Lock] = {}
+        self._xorg_locks: dict[int, asyncio.Lock] = {}
         self._sessions: dict[int, TerminalSession] = {}
+        self._xorg_sessions: dict[int, XorgSession] = {}
         self._control_states: dict[int, PendingChord] = {}
         # Handles component interactions after a bot restart, before a session
         # has recreated a message-specific view.
         self._persistent_view = TerminalControlView(self)
         self.bot.add_view(self._persistent_view)
+        self._persistent_xorg_view = XorgControlView(self)
+        self.bot.add_view(self._persistent_xorg_view)
 
     # ---- helpers ----
 
@@ -190,6 +195,66 @@ class ContainerControl(commands.Cog):
             session = self._sessions.pop(thread_id, None)
             if session:
                 await session.close()
+
+    async def _ensure_xorg(
+        self, record: UserContainer, thread: discord.Thread
+    ) -> XorgSession:
+        lock = self._xorg_locks.setdefault(record.thread_id, asyncio.Lock())
+        async with lock:
+            current = self._xorg_sessions.get(record.thread_id)
+            if current and current.started:
+                return current
+            session = XorgSession(self.bot, record, thread, self)  # type: ignore[arg-type]
+            self._xorg_sessions[record.thread_id] = session
+            try:
+                await session.start()
+            except Exception:
+                self._xorg_sessions.pop(record.thread_id, None)
+                raise
+            return session
+
+    async def _show_tty_display(
+        self, record: UserContainer, thread: discord.Thread
+    ) -> TerminalSession:
+        xorg = self._xorg_sessions.pop(record.thread_id, None)
+        if xorg:
+            await xorg.hide()
+        elif record.xorg_message_id:
+            try:
+                message = await thread.fetch_message(record.xorg_message_id)
+                await message.delete()
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                pass
+        record.xorg_message_id = None
+        record.display_mode = "tty"
+        session = await self._ensure_terminal(record, thread)
+        await session.show_message()
+        await self.bot.db.set_display(  # type: ignore[attr-defined]
+            record.user_id,
+            mode="tty",
+            terminal_message_id=session.message.id if session.message else None,
+            xorg_message_id=None,
+        )
+        return session
+
+    async def _close_xorg(self, record: UserContainer, thread: discord.Thread) -> None:
+        session = self._xorg_sessions.pop(record.thread_id, None)
+        if session:
+            await session.hide()
+        elif record.xorg_message_id:
+            try:
+                message = await thread.fetch_message(record.xorg_message_id)
+                await message.delete()
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                pass
+        record.xorg_message_id = None
+        record.display_mode = "tty"
+        await self.bot.db.set_display(  # type: ignore[attr-defined]
+            record.user_id,
+            mode="tty",
+            terminal_message_id=record.terminal_message_id,
+            xorg_message_id=None,
+        )
 
     def _control_view(self, thread_id: int) -> TerminalControlView:
         state = self._control_states.setdefault(thread_id, PendingChord())
@@ -259,13 +324,80 @@ class ContainerControl(commands.Cog):
                 ephemeral=True,
             )
 
+    async def handle_xorg_control(
+        self, interaction: discord.Interaction, action: str
+    ) -> None:
+        if not isinstance(interaction.channel, discord.Thread):
+            await interaction.response.send_message(
+                "This Xorg control is no longer linked to a thread.",
+                ephemeral=True,
+            )
+            return
+        record = await self.bot.db.get_by_thread(interaction.channel.id)  # type: ignore[attr-defined]
+        if (
+            record is None
+            or record.user_id != interaction.user.id
+            or record.display_mode != "xorg"
+            or interaction.message is None
+            or record.xorg_message_id != interaction.message.id
+        ):
+            await interaction.response.send_message(
+                "Only the owner can use this Xorg display's controls.",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.defer()
+        try:
+            lock = self._control_locks.setdefault(record.thread_id, asyncio.Lock())
+            async with lock:
+                session = await self._ensure_xorg(record, interaction.channel)
+                if action in ("up", "down", "left", "right"):
+                    await session.move(action)
+                elif action.startswith("step-"):
+                    step = int(action.removeprefix("step-"))
+                    if step not in (1, 10, 100):
+                        raise ValueError(f"Unsupported mouse step: {step}")
+                    session.state.step = step
+                elif action == "left-click":
+                    await session.toggle_mouse_button(1)
+                elif action == "right-click":
+                    await session.toggle_mouse_button(3)
+                elif action == "ctrl":
+                    session.state.ctrl = not session.state.ctrl
+                elif action == "alt":
+                    session.state.alt = not session.state.alt
+                elif action == "escape":
+                    await session.send_special("Escape")
+                elif action == "tab":
+                    await session.send_special("Tab")
+                elif action == "tty":
+                    await self._show_tty_display(record, interaction.channel)
+                    return
+                elif action != "refresh":
+                    raise ValueError(f"Unknown Xorg control: {action}")
+                terminal = self._sessions.get(record.thread_id)
+                if terminal and terminal.alive:
+                    terminal.touch_activity()
+                await session.refresh()
+        except Exception as e:
+            log.exception("Xorg component failed for user %s", record.user_id)
+            await interaction.followup.send(
+                f"Xorg control failed: `{_truncate(str(e), 1200)}`",
+                ephemeral=True,
+            )
+
     async def cog_unload(self) -> None:
         self._persistent_view.stop()
+        self._persistent_xorg_view.stop()
         sessions = list(self._sessions.values())
+        xorg_sessions = list(self._xorg_sessions.values())
         self._sessions.clear()
         self._control_states.clear()
+        self._xorg_sessions.clear()
         await asyncio.gather(
             *(session.close() for session in sessions),
+            *(session.release_mouse_buttons() for session in xorg_sessions),
             return_exceptions=True,
         )
 
@@ -407,6 +539,7 @@ class ContainerControl(commands.Cog):
             "- `/settings` - terminal size, format, idle timeout, and refresh rate\n"
             "- `/send` - send a key sequence such as `ctrl+alt+a+x`\n"
             "- `/reset` and `/refresh` - reset or redraw the TTY\n"
+            "- `/showxorg` and `/showtty` - switch between GUI and terminal displays\n"
             "- `/printtty` - move the current terminal display to the bottom\n"
             "- `/status` - show container status\n"
             "- `/start`, `/stop`, `/restart` - container lifecycle\n"
@@ -617,7 +750,7 @@ class ContainerControl(commands.Cog):
 
     @app_commands.command(
         name="refresh",
-        description="Immediately refresh the current TTY message.",
+        description="Immediately refresh the current TTY or Xorg display.",
     )
     @app_commands.guild_only()
     async def refresh(self, interaction: discord.Interaction) -> None:
@@ -628,15 +761,72 @@ class ContainerControl(commands.Cog):
         await interaction.response.defer(thinking=True, ephemeral=True)
         assert isinstance(interaction.channel, discord.Thread)
         try:
-            session = await self._ensure_terminal(rec, interaction.channel)
-            await session.refresh()
+            if rec.display_mode == "xorg":
+                session = await self._ensure_xorg(rec, interaction.channel)
+                await session.refresh()
+            else:
+                session = await self._ensure_terminal(rec, interaction.channel)
+                await session.refresh()
         except Exception as e:
             await interaction.followup.send(
                 f"Could not refresh the terminal: `{_truncate(str(e), 1000)}`",
                 ephemeral=True,
             )
             return
-        await interaction.followup.send("Terminal refreshed.", ephemeral=True)
+        await interaction.followup.send("Display refreshed.", ephemeral=True)
+
+    @app_commands.command(
+        name="showxorg",
+        description="Replace the TTY message with your headless Xorg desktop.",
+    )
+    @app_commands.guild_only()
+    async def showxorg(self, interaction: discord.Interaction) -> None:
+        rec = await self._require_owner_in_thread(interaction)
+        if rec is None:
+            return
+        await interaction.response.defer(thinking=True, ephemeral=True)
+        assert isinstance(interaction.channel, discord.Thread)
+        terminal: TerminalSession | None = None
+        try:
+            terminal = await self._ensure_terminal(rec, interaction.channel)
+            await terminal.hide_message()
+            await self._ensure_xorg(rec, interaction.channel)
+        except Exception as e:
+            log.exception("Could not show Xorg for user %s", rec.user_id)
+            try:
+                await self._show_tty_display(rec, interaction.channel)
+            except Exception:
+                pass
+            await interaction.followup.send(
+                f"Could not start the Xorg display: `{_truncate(str(e), 1400)}`",
+                ephemeral=True,
+            )
+            return
+        await interaction.followup.send(
+            "Xorg display opened. The TTY is still running in the background.",
+            ephemeral=True,
+        )
+
+    @app_commands.command(
+        name="showtty",
+        description="Replace the Xorg image with the still-running TTY display.",
+    )
+    @app_commands.guild_only()
+    async def showtty(self, interaction: discord.Interaction) -> None:
+        rec = await self._require_owner_in_thread(interaction)
+        if rec is None:
+            return
+        await interaction.response.defer(thinking=True, ephemeral=True)
+        assert isinstance(interaction.channel, discord.Thread)
+        try:
+            await self._show_tty_display(rec, interaction.channel)
+        except Exception as e:
+            await interaction.followup.send(
+                f"Could not show the TTY: `{_truncate(str(e), 1200)}`",
+                ephemeral=True,
+            )
+            return
+        await interaction.followup.send("TTY display restored.", ephemeral=True)
 
     @app_commands.command(
         name="printtty",
@@ -651,7 +841,7 @@ class ContainerControl(commands.Cog):
         await interaction.response.defer(thinking=True, ephemeral=True)
         assert isinstance(interaction.channel, discord.Thread)
         try:
-            session = await self._ensure_terminal(rec, interaction.channel)
+            session = await self._show_tty_display(rec, interaction.channel)
             session.set_controls(self._control_view(rec.thread_id))
             await session.repost()
         except Exception as e:
@@ -693,6 +883,14 @@ class ContainerControl(commands.Cog):
         try:
             lock = self._control_locks.setdefault(rec.thread_id, asyncio.Lock())
             async with lock:
+                if rec.display_mode == "xorg":
+                    xorg = await self._ensure_xorg(rec, message.channel)
+                    await xorg.send_text(message.content)
+                    terminal = self._sessions.get(rec.thread_id)
+                    if terminal and terminal.alive:
+                        terminal.touch_activity()
+                    await xorg.refresh()
+                    return
                 session = await self._ensure_terminal(rec, message.channel)
                 state = self._control_states.setdefault(
                     rec.thread_id, PendingChord()
@@ -712,9 +910,9 @@ class ContainerControl(commands.Cog):
                 else:
                     await session.send_message_input(message.content)
         except Exception as e:
-            log.exception("Could not send TTY input for user %s", rec.user_id)
+            log.exception("Could not send display input for user %s", rec.user_id)
             await message.channel.send(
-                f"Input was not executed because the terminal is unavailable: "
+                f"Input was not executed because the active display is unavailable: "
                 f"`{_truncate(str(e), 1200)}`"
             )
 
@@ -752,7 +950,7 @@ class ContainerControl(commands.Cog):
         await self.bot.db.update_status(rec.user_id, rec.guild_id, "running")  # type: ignore[attr-defined]
         assert isinstance(interaction.channel, discord.Thread)
         try:
-            await self._ensure_terminal(rec, interaction.channel)
+            await self._show_tty_display(rec, interaction.channel)
         except Exception as e:
             await interaction.followup.send(
                 f"Container started, but the terminal could not be opened: "
@@ -773,6 +971,8 @@ class ContainerControl(commands.Cog):
             return
 
         await interaction.response.defer(thinking=True, ephemeral=True)
+        assert isinstance(interaction.channel, discord.Thread)
+        await self._close_xorg(rec, interaction.channel)
         await self._close_terminal(rec.thread_id)
         try:
             ok = await self.bot.docker.restart_container(rec.container_id)  # type: ignore[attr-defined]
@@ -788,11 +988,16 @@ class ContainerControl(commands.Cog):
             return
 
         await self.bot.db.update_status(rec.user_id, rec.guild_id, "running")  # type: ignore[attr-defined]
-        assert isinstance(interaction.channel, discord.Thread)
         try:
             self._control_states[rec.thread_id] = PendingChord()
             session = await self._ensure_terminal(rec, interaction.channel)
             await session.refresh()
+            await self.bot.db.set_display(  # type: ignore[attr-defined]
+                rec.user_id,
+                mode="tty",
+                terminal_message_id=session.message.id if session.message else None,
+                xorg_message_id=None,
+            )
         except Exception as e:
             await interaction.followup.send(
                 f"Container restarted, but the TTY could not be opened: "
@@ -809,6 +1014,8 @@ class ContainerControl(commands.Cog):
         if rec is None:
             return
         await interaction.response.defer(thinking=True, ephemeral=True)
+        assert isinstance(interaction.channel, discord.Thread)
+        await self._close_xorg(rec, interaction.channel)
         await self._close_terminal(rec.thread_id)
         ok = await self.bot.docker.stop_container(rec.container_id)  # type: ignore[attr-defined]
         if not ok:
@@ -829,6 +1036,8 @@ class ContainerControl(commands.Cog):
             return
 
         await interaction.response.defer(thinking=True, ephemeral=True)
+        assert isinstance(interaction.channel, discord.Thread)
+        await self._close_xorg(rec, interaction.channel)
         await self._close_terminal(rec.thread_id)
         try:
             await self.bot.docker.remove_container(rec.container_id)  # type: ignore[attr-defined]

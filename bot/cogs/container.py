@@ -375,6 +375,7 @@ class ContainerControl(commands.Cog):
             return
 
         try:
+            defaults = self.bot.config.user_defaults  # type: ignore[attr-defined]
             record = await self.bot.db.create_user_container(  # type: ignore[attr-defined]
                 user_id=user.id,
                 guild_id=interaction.guild_id,
@@ -382,6 +383,11 @@ class ContainerControl(commands.Cog):
                 container_id=container.id,
                 container_name=container.name or "",
                 status="running",
+                terminal_columns=defaults.columns,
+                terminal_rows=defaults.rows,
+                terminal_idle_minutes=defaults.idle_minutes,
+                terminal_rich_embed=defaults.rich_embed,
+                terminal_refresh_seconds=defaults.refresh_seconds,
             )
         except Exception as e:
             log.exception("Failed to save container record, cleaning up")

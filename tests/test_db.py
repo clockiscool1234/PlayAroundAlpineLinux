@@ -57,6 +57,29 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
         await self.db.delete_user_container(456, 2)
         self.assertIsNone(await self.db.get_user_container(456))
 
+    async def test_new_container_uses_configured_terminal_defaults(self) -> None:
+        record = await self.db.create_user_container(
+            user_id=789,
+            guild_id=2,
+            thread_id=31,
+            container_id="custom",
+            container_name="discord-alpine-789",
+            terminal_columns=100,
+            terminal_rows=17,
+            terminal_idle_minutes=30,
+            terminal_rich_embed=False,
+            terminal_refresh_seconds=8,
+        )
+
+        self.assertEqual(record.terminal_columns, 100)
+        self.assertEqual(record.terminal_rows, 17)
+        self.assertEqual(record.terminal_idle_minutes, 30)
+        self.assertEqual(record.terminal_rich_embed, 0)
+        self.assertEqual(record.terminal_refresh_seconds, 8)
+
+        saved = await self.db.get_user_container(789)
+        self.assertEqual(saved, record)
+
 
 class DatabaseMigrationTests(unittest.IsolatedAsyncioTestCase):
     async def test_terminal_columns_are_added_to_old_database(self) -> None:

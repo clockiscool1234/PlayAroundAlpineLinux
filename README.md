@@ -24,7 +24,7 @@ This is an initial implementation designed to be extended as requirements become
   - `/stop`
   - `/restart`
   - `/destroycontainer`
-- SQLite persistence across bot restarts.
+- SQLite settings/ownership persistence and Docker writable-layer data persistence across bot and host reboots.
 - Default Alpine image: `alpine:3.20`.
 - 512 MiB memory limit with no additional swap.
 - 1 GiB writable-layer disk quota; creation fails if Docker cannot enforce it.
@@ -53,6 +53,14 @@ Send a normal message in the private control thread to type that text followed b
 Only the container owner can operate its terminal buttons. Discord is not a low-latency transport, but programs such as editors, pagers, and process monitors can retain terminal state and react to input.
 
 The TTY remains attached until its configured inactivity timeout, an explicit stop, or a bot restart. The next input opens a fresh shell in the same container; container files remain, but a foreground interactive program from the old TTY should be considered disconnected.
+
+Every fresh TTY prints the container's current `/etc/motd`. This includes a TTY opened after its inactivity timeout and the fresh TTY opened by `/restart`.
+
+### Container data persistence
+
+User files are stored in each Docker container's writable layer, not in the bot container. Docker retains that layer across bot restarts and host reboots, and each user container has an `unless-stopped` restart policy. `/stop` stops processes without deleting files; `/start` and `/restart` reuse the same writable layer. Only `/destroycontainer` intentionally removes the container and its writable-layer data.
+
+The ownership/settings database is stored at `./data/bot.db` by the Compose bind mount. Back up both Docker's data root and `./data` for disaster recovery. Docker data-root loss, manual `docker rm`, or container-pruning commands can still delete user data; this is persistence, not a backup.
 
 ## Security warning
 
@@ -204,6 +212,28 @@ Compose mounts the host Docker socket so the bot can create sibling containers. 
 | `CONTAINER_NETWORK` | `alpine-filtered` | Internal Docker network created by Compose |
 | `CONTAINER_HTTP_PROXY` | `http://172.30.0.2:3128` | Filtering proxy injected into user containers |
 | `DATABASE_PATH` | `data/bot.db` | SQLite database path |
+| `USER_DEFAULTS_PATH` | `config/user-defaults.toml` | TOML defaults copied into each new user's settings |
+
+### New-user settings defaults
+
+Edit `config/user-defaults.toml` to control the initial `/settings` values assigned when a user creates a container:
+
+```toml
+[terminal]
+columns = 80
+rows = 22
+idle_minutes = 10
+rich_embed = true
+refresh_seconds = 3
+```
+
+The accepted ranges are the same as `/settings`: columns 20–120, rows 5–40, idle timeout 0–1440 minutes, and refresh interval 1–30 seconds. The terminal area must not exceed 1760 characters. Invalid files fail startup with a descriptive error.
+
+These are creation-time defaults. Changing the file does not overwrite existing users' saved choices. Recreate the bot service to load an edited file:
+
+```bash
+docker compose up -d --force-recreate bot
+```
 
 ## Tests
 
@@ -223,6 +253,7 @@ bot/docker_manager.py    Container lifecycle and command execution
 bot/terminal.py          Persistent TTY, ANSI screen renderer, and key input
 bot/cogs/container.py    Discord slash commands and ownership checks
 bot/main.py              Bot startup and command synchronization
+config/user-defaults.toml  Initial per-user terminal settings
 network-filter/          Squid policy proxy and blocklist generator
 blocklists/              Pinned upstream Git submodules
 tests/                   Unit tests

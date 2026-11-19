@@ -9,6 +9,7 @@ COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY bot ./bot
+COPY config ./config
 COPY run.py ./run.py
 
 CMD ["python", "run.py"]

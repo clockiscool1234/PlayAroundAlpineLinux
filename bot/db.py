@@ -137,15 +137,36 @@ class Database:
         container_id: str,
         container_name: str,
         status: str = "running",
+        terminal_columns: int = 80,
+        terminal_rows: int = 22,
+        terminal_idle_minutes: int = 10,
+        terminal_rich_embed: bool = True,
+        terminal_refresh_seconds: int = 3,
     ) -> UserContainer:
         created_at = int(time.time())
         await self.db.execute(
             """
             INSERT INTO user_containers
-                (user_id, guild_id, thread_id, container_id, container_name, created_at, status)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+                (user_id, guild_id, thread_id, container_id, container_name,
+                 created_at, status, terminal_columns, terminal_rows,
+                 terminal_idle_minutes, terminal_rich_embed,
+                 terminal_refresh_seconds)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (user_id, guild_id, thread_id, container_id, container_name, created_at, status),
+            (
+                user_id,
+                guild_id,
+                thread_id,
+                container_id,
+                container_name,
+                created_at,
+                status,
+                terminal_columns,
+                terminal_rows,
+                terminal_idle_minutes,
+                int(terminal_rich_embed),
+                terminal_refresh_seconds,
+            ),
         )
         await self.db.commit()
         return UserContainer(
@@ -156,6 +177,11 @@ class Database:
             container_name=container_name,
             created_at=created_at,
             status=status,
+            terminal_columns=terminal_columns,
+            terminal_rows=terminal_rows,
+            terminal_idle_minutes=terminal_idle_minutes,
+            terminal_rich_embed=int(terminal_rich_embed),
+            terminal_refresh_seconds=terminal_refresh_seconds,
         )
 
     async def update_status(self, user_id: int, guild_id: int, status: str) -> None:

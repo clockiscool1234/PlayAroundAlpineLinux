@@ -1,0 +1,9 @@
+# Defaults copied into each new user's saved /settings values.
+# Changing this file does not overwrite settings for existing users.
+
+[terminal]
+columns = 80
+rows = 22
+idle_minutes = 10
+rich_embed = true
+refresh_seconds = 3

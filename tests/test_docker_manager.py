@@ -42,8 +42,10 @@ class FakeAPI:
         self.resize = None
         self.create_kwargs = None
         self.start_kwargs = None
+        self.create_args = None
 
     def exec_create(self, *args, **kwargs):
+        self.create_args = args
         self.create_kwargs = kwargs
         return {"Id": "exec-id"}
 
@@ -101,6 +103,7 @@ class DockerManagerTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(kwargs["cap_drop"], ["ALL"])
         self.assertEqual(kwargs["security_opt"], ["no-new-privileges:true"])
+        self.assertEqual(kwargs["restart_policy"], {"Name": "unless-stopped"})
 
     async def test_terminal_uses_requested_pty_size(self) -> None:
         manager, client = self.manager()
@@ -117,6 +120,9 @@ class DockerManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(client.api.create_kwargs["tty"])
         self.assertEqual(client.api.start_kwargs, {"tty": True, "socket": True})
         self.assertEqual(client.api.resize, ("exec-id", 22, 80))
+        command = client.api.create_args[1]
+        self.assertIn("cat /etc/motd", command[2])
+        self.assertIn("exec /bin/sh -l", command[2])
 
     async def test_restart_container(self) -> None:
         manager, client = self.manager()

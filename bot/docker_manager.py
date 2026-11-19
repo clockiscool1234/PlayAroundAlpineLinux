@@ -209,7 +209,12 @@ class DockerManager:
         def _open() -> TerminalConnection:
             created = self.client.api.exec_create(
                 container.id,
-                ["/bin/sh", "-l"],
+                [
+                    "/bin/sh",
+                    "-c",
+                    "if [ -r /etc/motd ]; then cat /etc/motd; fi; "
+                    "exec /bin/sh -l",
+                ],
                 stdin=True,
                 stdout=True,
                 stderr=True,

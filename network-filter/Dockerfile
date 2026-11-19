@@ -11,4 +11,6 @@ RUN chmod +x /usr/local/bin/generate-blocklists /usr/local/bin/network-filter-en
 
 EXPOSE 3128
 
+USER squid
+
 ENTRYPOINT ["/usr/local/bin/network-filter-entrypoint"]

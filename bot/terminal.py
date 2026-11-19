@@ -44,6 +44,8 @@ class TerminalSession:
         self.columns = record.terminal_columns
         self.rows = record.terminal_rows
         self.idle_minutes = record.terminal_idle_minutes
+        self.rich_embed = bool(record.terminal_rich_embed)
+        self.refresh_seconds = record.terminal_refresh_seconds
         self.screen = pyte.Screen(self.columns, self.rows)
         self.stream = pyte.Stream(self.screen)
         self.decoder = codecs.getincrementaldecoder("utf-8")("replace")
@@ -61,7 +63,9 @@ class TerminalSession:
         self._idle_expired = False
         self._last_activity = time.monotonic()
         self._dirty = False
-        self._last_rendered: tuple[str, bool, int, int, int, bool] | None = None
+        self._last_rendered: tuple[
+            str, bool, int, int, int, bool, bool, int
+        ] | None = None
 
     def set_controls(self, controls: discord.ui.View) -> None:
         self.controls = controls
@@ -105,11 +109,18 @@ class TerminalSession:
                 self.message = None
 
         if self.message is None:
-            self.message = await self.thread.send(
-                embed=self.build_embed(initial=initial),
-                view=self.controls,
-                allowed_mentions=discord.AllowedMentions.none(),
-            )
+            if self.rich_embed:
+                self.message = await self.thread.send(
+                    embed=self.build_embed(initial=initial),
+                    view=self.controls,
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+            else:
+                self.message = await self.thread.send(
+                    self.build_plain_content(initial=initial),
+                    view=self.controls,
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
             self.record.terminal_message_id = self.message.id
             await self.bot.db.set_terminal_message(
                 self.record.user_id, self.message.id
@@ -222,12 +233,12 @@ class TerminalSession:
 
     async def _render_loop(self) -> None:
         # Coalesce bursts of TTY output to stay below Discord edit rate limits.
-        await asyncio.sleep(0.4)
+        await asyncio.sleep(self.refresh_seconds)
         while self._dirty and not self._closing:
             self._dirty = False
             await self._render()
             if self._dirty:
-                await asyncio.sleep(0.7)
+                await asyncio.sleep(self.refresh_seconds)
 
     def _screen_text(self, initial: str = "") -> str:
         if initial:
@@ -242,8 +253,7 @@ class TerminalSession:
         # Prevent terminal output from closing Discord's Markdown code fence.
         return "\n".join(lines).replace("`", "ˋ")
 
-    def build_embed(self, *, initial: str = "") -> discord.Embed:
-        terminal = self._screen_text(initial)
+    def _status_text(self, *, initial: str = "") -> tuple[discord.Colour, str]:
         if self.alive:
             colour = discord.Colour.green()
             status = "Connected"
@@ -257,23 +267,37 @@ class TerminalSession:
                 if self._idle_expired
                 else "Disconnected — next input opens a new shell"
             )
+        return colour, status
 
+    def _display_footer(self, *, initial: str = "") -> str:
+        _, status = self._status_text(initial=initial)
         idle = "off" if self.idle_minutes == 0 else f"{self.idle_minutes}m"
+        return (
+            f"TTY display • {self.columns}×{self.rows} • {status} • "
+            f"Idle: {idle} • Refresh: {self.refresh_seconds}s"
+        )
+
+    def build_embed(self, *, initial: str = "") -> discord.Embed:
+        terminal = self._screen_text(initial)
+        colour, _ = self._status_text(initial=initial)
 
         embed = discord.Embed(
             title="Alpine Linux TTY",
             description=f"```\n{terminal}\n```",
             colour=colour,
         )
-        embed.set_footer(
-            text=(
-                f"TTY display • {self.columns}×{self.rows} • {status} • "
-                f"Idle: {idle} • Toggle keys, then press Send"
-            )
-        )
+        embed.set_footer(text=self._display_footer(initial=initial))
         return embed
 
-    def _render_fingerprint(self) -> tuple[str, bool, int, int, int, bool]:
+    def build_plain_content(self, *, initial: str = "") -> str:
+        return (
+            f"```\n{self._screen_text(initial)}\n```\n"
+            f"`{self._display_footer(initial=initial)}`"
+        )
+
+    def _render_fingerprint(
+        self,
+    ) -> tuple[str, bool, int, int, int, bool, bool, int]:
         return (
             self._screen_text(),
             self.alive,
@@ -281,6 +305,8 @@ class TerminalSession:
             self.rows,
             self.idle_minutes,
             self._idle_expired,
+            self.rich_embed,
+            self.refresh_seconds,
         )
 
     async def _render(self) -> None:
@@ -291,12 +317,20 @@ class TerminalSession:
                 return
             try:
                 assert self.message is not None
-                self.message = await self.message.edit(
-                    content=None,
-                    embed=self.build_embed(),
-                    view=self.controls,
-                    allowed_mentions=discord.AllowedMentions.none(),
-                )
+                if self.rich_embed:
+                    self.message = await self.message.edit(
+                        content=None,
+                        embed=self.build_embed(),
+                        view=self.controls,
+                        allowed_mentions=discord.AllowedMentions.none(),
+                    )
+                else:
+                    self.message = await self.message.edit(
+                        content=self.build_plain_content(),
+                        embed=None,
+                        view=self.controls,
+                        allowed_mentions=discord.AllowedMentions.none(),
+                    )
                 self._last_rendered = fingerprint
             except discord.NotFound:
                 self.message = None
@@ -316,7 +350,10 @@ class TerminalSession:
                     and embed.footer.text.startswith("TTY display •")
                     for embed in message.embeds
                 )
-                if not is_current and not is_tty_embed:
+                is_tty_text = bool(
+                    message.content and "`TTY display •" in message.content
+                )
+                if not is_current and not is_tty_embed and not is_tty_text:
                     continue
                 try:
                     await message.delete()
@@ -333,7 +370,8 @@ class TerminalSession:
     async def send_message_input(self, text: str) -> None:
         await self.write(text.encode("utf-8", errors="replace") + b"\n")
 
-    async def send_key_chord(self, key: str, *, ctrl: bool, alt: bool) -> None:
+    @staticmethod
+    def key_chord_bytes(key: str, *, ctrl: bool, alt: bool) -> bytes:
         if key not in KEY_BYTES:
             raise ValueError(f"Unknown terminal key: {key}")
 
@@ -356,7 +394,78 @@ class TerminalSession:
         elif key == "escape" and alt:
             payload = b"\x1b\x1b"
 
+        return payload
+
+    @staticmethod
+    def modified_text_bytes(text: str, *, ctrl: bool, alt: bool) -> bytes:
+        if not text:
+            return b""
+
+        first = text[0]
+        if ctrl and ord(first) < 128:
+            first_bytes = bytes((ord(first.upper()) & 0x1F,))
+        else:
+            first_bytes = first.encode("utf-8", errors="replace")
+        payload = first_bytes + text[1:].encode("utf-8", errors="replace")
+        return b"\x1b" + payload if alt else payload
+
+    async def send_key_chord(self, key: str, *, ctrl: bool, alt: bool) -> None:
+        await self.write(self.key_chord_bytes(key, ctrl=ctrl, alt=alt))
+
+    async def send_pending_text(
+        self,
+        text: str,
+        *,
+        key: str | None,
+        ctrl: bool,
+        alt: bool,
+    ) -> None:
+        payload = b""
+        if key is not None:
+            payload += self.key_chord_bytes(key, ctrl=ctrl, alt=alt)
+            ctrl = False
+            alt = False
+        payload += self.modified_text_bytes(text, ctrl=ctrl, alt=alt)
         await self.write(payload)
+
+    async def send_key_sequence(self, expression: str) -> None:
+        tokens = [token.strip() for token in expression.split("+")]
+        tokens = [token for token in tokens if token]
+        if not tokens:
+            raise ValueError("Key sequence cannot be empty")
+
+        payload = b""
+        ctrl = False
+        alt = False
+        sent_key = False
+        aliases = {"esc": "escape"}
+        for token in tokens:
+            token_name = token.lower()
+            if token_name == "ctrl":
+                ctrl = True
+                continue
+            if token_name == "alt":
+                alt = True
+                continue
+
+            key = aliases.get(token_name, token_name)
+            if key in KEY_BYTES:
+                payload += self.key_chord_bytes(key, ctrl=ctrl, alt=alt)
+            else:
+                payload += self.modified_text_bytes(token, ctrl=ctrl, alt=alt)
+            ctrl = False
+            alt = False
+            sent_key = True
+
+        if ctrl or alt or not sent_key:
+            raise ValueError("Ctrl or Alt must be followed by a letter or special key")
+        await self.write(payload)
+
+    async def reset_terminal(self) -> None:
+        self.screen.reset()
+        self._last_rendered = None
+        await self.write(b"reset\n")
+        await self.refresh()
 
     async def write(self, data: bytes) -> None:
         if not self.alive or self.connection is None:
@@ -413,6 +522,19 @@ class TerminalSession:
         self.record.terminal_idle_minutes = minutes
         self.touch_activity()
         self._start_idle_task()
+        self._last_rendered = None
+        self.request_render()
+
+    def update_display_settings(
+        self, *, rich_embed: bool, refresh_seconds: int
+    ) -> None:
+        self.rich_embed = rich_embed
+        self.refresh_seconds = refresh_seconds
+        self.record.terminal_rich_embed = int(rich_embed)
+        self.record.terminal_refresh_seconds = refresh_seconds
+        if self.render_task and not self.render_task.done():
+            self.render_task.cancel()
+        self.render_task = None
         self._last_rendered = None
         self.request_render()
 

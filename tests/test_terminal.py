@@ -66,6 +66,21 @@ class TerminalInputTests(unittest.IsolatedAsyncioTestCase):
         await session.send_key_chord("up", ctrl=True, alt=False)
         self.assertEqual(socket.data, b"\x1b[1;5A")
 
+    async def test_pending_ctrl_modifier_applies_to_message(self) -> None:
+        session, socket = self.session()
+        await session.send_pending_text("x", key=None, ctrl=True, alt=False)
+        self.assertEqual(socket.data, b"\x18")
+
+    async def test_pending_ctrl_alt_apply_to_first_letter(self) -> None:
+        session, socket = self.session()
+        await session.send_pending_text("ax", key=None, ctrl=True, alt=True)
+        self.assertEqual(socket.data, b"\x1b\x01x")
+
+    async def test_slash_key_sequence_parser(self) -> None:
+        session, socket = self.session()
+        await session.send_key_sequence("ctrl+alt+a+x")
+        self.assertEqual(socket.data, b"\x1b\x01x")
+
     async def test_alt_arrow_uses_modified_escape_sequence(self) -> None:
         session, socket = self.session()
         await session.send_key_chord("up", ctrl=False, alt=True)
@@ -76,6 +91,15 @@ class TerminalInputTests(unittest.IsolatedAsyncioTestCase):
         description = session.build_embed().description
         self.assertIsNotNone(description)
         terminal = description.removeprefix("```\n").removesuffix("\n```")  # type: ignore[union-attr]
+        lines = terminal.split("\n")
+        self.assertEqual(len(lines), 22)
+        self.assertTrue(all(len(line) == 80 for line in lines))
+
+    async def test_plain_terminal_message_contains_fixed_screen(self) -> None:
+        session, _ = self.session()
+        session.rich_embed = False
+        content = session.build_plain_content()
+        terminal = content.split("```\n", 1)[1].split("\n```", 1)[0]
         lines = terminal.split("\n")
         self.assertEqual(len(lines), 22)
         self.assertTrue(all(len(line) == 80 for line in lines))

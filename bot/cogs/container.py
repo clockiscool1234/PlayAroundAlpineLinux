@@ -126,6 +126,7 @@ class ContainerControl(commands.Cog):
         self.bot = bot
         self._creation_locks: dict[int, asyncio.Lock] = {}
         self._session_locks: dict[int, asyncio.Lock] = {}
+        self._control_locks: dict[int, asyncio.Lock] = {}
         self._sessions: dict[int, TerminalSession] = {}
         self._control_states: dict[int, PendingChord] = {}
         # Handles component interactions after a bot restart, before a session
@@ -227,28 +228,30 @@ class ContainerControl(commands.Cog):
 
         await interaction.response.defer()
         try:
-            session = await self._ensure_terminal(record, interaction.channel)
-            if action == "ctrl":
-                state.ctrl = not state.ctrl
-            elif action == "alt":
-                state.alt = not state.alt
-            elif action in ("up", "down", "left", "right", "escape", "tab"):
-                state.key = None if state.key == action else action
-            elif action == "send":
-                assert state.key is not None
-                await session.send_key_chord(
-                    state.key,
-                    ctrl=state.ctrl,
-                    alt=state.alt,
-                )
-                state.ctrl = False
-                state.alt = False
-                state.key = None
-            else:
-                raise ValueError(f"Unknown terminal control: {action}")
+            lock = self._control_locks.setdefault(record.thread_id, asyncio.Lock())
+            async with lock:
+                session = await self._ensure_terminal(record, interaction.channel)
+                if action == "ctrl":
+                    state.ctrl = not state.ctrl
+                elif action == "alt":
+                    state.alt = not state.alt
+                elif action in ("up", "down", "left", "right", "escape", "tab"):
+                    state.key = None if state.key == action else action
+                elif action == "send":
+                    assert state.key is not None
+                    await session.send_key_chord(
+                        state.key,
+                        ctrl=state.ctrl,
+                        alt=state.alt,
+                    )
+                    state.ctrl = False
+                    state.alt = False
+                    state.key = None
+                else:
+                    raise ValueError(f"Unknown terminal control: {action}")
 
-            session.set_controls(self._control_view(record.thread_id))
-            await session.refresh()
+                session.set_controls(self._control_view(record.thread_id))
+                await session.refresh()
         except Exception as e:
             log.exception("Terminal component failed for user %s", record.user_id)
             await interaction.followup.send(
@@ -395,14 +398,16 @@ class ContainerControl(commands.Cog):
             "Send a normal message in this thread to type it into the terminal. "
             "Your input message will be deleted and the terminal display below will update.\n\n"
             "Commands you can use:\n"
-            "- `/settings` - view or change terminal dimensions\n"
+            "- `/settings` - terminal size, format, idle timeout, and refresh rate\n"
+            "- `/send` - send a key sequence such as `ctrl+alt+a+x`\n"
+            "- `/reset` and `/refresh` - reset or redraw the TTY\n"
             "- `/printtty` - move the current terminal display to the bottom\n"
             "- `/status` - show container status\n"
-            "- `/stop` - stop the container\n"
-            "- `/start` - start the container\n"
+            "- `/start`, `/stop`, `/restart` - container lifecycle\n"
             "- `/destroycontainer` - permanently delete the container and its data\n\n"
             "Use the buttons below the terminal to select arrows, Ctrl, Alt, "
-            "Esc, or Tab, then press **Send** to transmit the combination.\n\n"
+            "Esc, or Tab, then press **Send** to transmit the combination. "
+            "You can also toggle modifiers and send letters as a normal message.\n\n"
             "The terminal runs as root in `/root` and stays up until you stop/destroy it."
         )
         try:
@@ -425,6 +430,8 @@ class ContainerControl(commands.Cog):
         columns="Terminal width (20-120)",
         rows="Terminal height (5-40)",
         idle_minutes="Disconnect an inactive TTY after this many minutes (0 disables)",
+        rich_embed="Use a rich embed instead of a plain text TTY message",
+        refresh_seconds="TTY output refresh interval in seconds (1-30)",
     )
     @app_commands.guild_only()
     async def settings(
@@ -433,6 +440,8 @@ class ContainerControl(commands.Cog):
         columns: Optional[app_commands.Range[int, 20, 120]] = None,
         rows: Optional[app_commands.Range[int, 5, 40]] = None,
         idle_minutes: Optional[app_commands.Range[int, 0, 1440]] = None,
+        rich_embed: Optional[bool] = None,
+        refresh_seconds: Optional[app_commands.Range[int, 1, 30]] = None,
     ) -> None:
         rec = await self._require_owner_in_thread(interaction)
         if rec is None:
@@ -445,6 +454,16 @@ class ContainerControl(commands.Cog):
             if idle_minutes is not None
             else rec.terminal_idle_minutes
         )
+        new_rich_embed = (
+            rich_embed
+            if rich_embed is not None
+            else bool(rec.terminal_rich_embed)
+        )
+        new_refresh_seconds = (
+            refresh_seconds
+            if refresh_seconds is not None
+            else rec.terminal_refresh_seconds
+        )
         if new_columns * new_rows > 1760:
             await interaction.response.send_message(
                 "That terminal is too large for one Discord message. "
@@ -453,7 +472,13 @@ class ContainerControl(commands.Cog):
             )
             return
 
-        if columns is None and rows is None and idle_minutes is None:
+        if (
+            columns is None
+            and rows is None
+            and idle_minutes is None
+            and rich_embed is None
+            and refresh_seconds is None
+        ):
             idle_description = (
                 "disabled"
                 if rec.terminal_idle_minutes == 0
@@ -461,7 +486,9 @@ class ContainerControl(commands.Cog):
             )
             await interaction.response.send_message(
                 f"Terminal size: `{rec.terminal_columns}×{rec.terminal_rows}`\n"
-                f"Idle timeout: `{idle_description}`",
+                f"Idle timeout: `{idle_description}`\n"
+                f"Rich embed: `{'enabled' if rec.terminal_rich_embed else 'disabled'}`\n"
+                f"Refresh interval: `{rec.terminal_refresh_seconds}s`",
                 ephemeral=True,
             )
             return
@@ -472,6 +499,8 @@ class ContainerControl(commands.Cog):
             columns=new_columns,
             rows=new_rows,
             idle_minutes=new_idle_minutes,
+            rich_embed=new_rich_embed,
+            refresh_seconds=new_refresh_seconds,
         )
         dimensions_changed = (
             new_columns != rec.terminal_columns or new_rows != rec.terminal_rows
@@ -479,12 +508,19 @@ class ContainerControl(commands.Cog):
         rec.terminal_columns = new_columns
         rec.terminal_rows = new_rows
         rec.terminal_idle_minutes = new_idle_minutes
+        rec.terminal_rich_embed = int(new_rich_embed)
+        rec.terminal_refresh_seconds = new_refresh_seconds
         session = self._sessions.get(rec.thread_id)
         if session:
             session.update_idle_timeout(new_idle_minutes)
+            session.update_display_settings(
+                rich_embed=new_rich_embed,
+                refresh_seconds=new_refresh_seconds,
+            )
             try:
                 if dimensions_changed:
                     await session.resize(columns=new_columns, rows=new_rows)
+                await session.refresh()
             except Exception as e:
                 log.exception("Could not resize active terminal for user %s", rec.user_id)
                 await interaction.followup.send(
@@ -500,9 +536,101 @@ class ContainerControl(commands.Cog):
         await interaction.followup.send(
             f"Terminal settings updated:\n"
             f"- Size: `{new_columns}×{new_rows}`\n"
-            f"- Idle timeout: `{idle_description}`",
+            f"- Idle timeout: `{idle_description}`\n"
+            f"- Rich embed: `{'enabled' if new_rich_embed else 'disabled'}`\n"
+            f"- Refresh interval: `{new_refresh_seconds}s`",
             ephemeral=True,
         )
+
+    @app_commands.command(
+        name="send",
+        description="Send a key sequence when terminal buttons are unavailable.",
+    )
+    @app_commands.describe(
+        keys="Keys joined by +, e.g. ctrl+x or ctrl+alt+a+x"
+    )
+    @app_commands.guild_only()
+    async def send_keys(
+        self, interaction: discord.Interaction, keys: str
+    ) -> None:
+        rec = await self._require_owner_in_thread(interaction)
+        if rec is None:
+            return
+
+        await interaction.response.defer(thinking=True, ephemeral=True)
+        assert isinstance(interaction.channel, discord.Thread)
+        try:
+            lock = self._control_locks.setdefault(rec.thread_id, asyncio.Lock())
+            async with lock:
+                session = await self._ensure_terminal(rec, interaction.channel)
+                await session.send_key_sequence(keys)
+                state = self._control_states.setdefault(
+                    rec.thread_id, PendingChord()
+                )
+                state.ctrl = False
+                state.alt = False
+                state.key = None
+                session.set_controls(self._control_view(rec.thread_id))
+                await session.refresh()
+        except Exception as e:
+            await interaction.followup.send(
+                f"Could not send that key sequence: `{_truncate(str(e), 1000)}`",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.followup.send("Key sequence sent.", ephemeral=True)
+
+    @app_commands.command(
+        name="reset",
+        description="Run reset in the active TTY and clear its rendered screen.",
+    )
+    @app_commands.guild_only()
+    async def reset(self, interaction: discord.Interaction) -> None:
+        rec = await self._require_owner_in_thread(interaction)
+        if rec is None:
+            return
+
+        await interaction.response.defer(thinking=True, ephemeral=True)
+        assert isinstance(interaction.channel, discord.Thread)
+        try:
+            session = await self._ensure_terminal(rec, interaction.channel)
+            state = self._control_states.setdefault(rec.thread_id, PendingChord())
+            state.ctrl = False
+            state.alt = False
+            state.key = None
+            session.set_controls(self._control_view(rec.thread_id))
+            await session.reset_terminal()
+        except Exception as e:
+            await interaction.followup.send(
+                f"Could not reset the terminal: `{_truncate(str(e), 1000)}`",
+                ephemeral=True,
+            )
+            return
+        await interaction.followup.send("Terminal reset requested.", ephemeral=True)
+
+    @app_commands.command(
+        name="refresh",
+        description="Immediately refresh the current TTY message.",
+    )
+    @app_commands.guild_only()
+    async def refresh(self, interaction: discord.Interaction) -> None:
+        rec = await self._require_owner_in_thread(interaction)
+        if rec is None:
+            return
+
+        await interaction.response.defer(thinking=True, ephemeral=True)
+        assert isinstance(interaction.channel, discord.Thread)
+        try:
+            session = await self._ensure_terminal(rec, interaction.channel)
+            await session.refresh()
+        except Exception as e:
+            await interaction.followup.send(
+                f"Could not refresh the terminal: `{_truncate(str(e), 1000)}`",
+                ephemeral=True,
+            )
+            return
+        await interaction.followup.send("Terminal refreshed.", ephemeral=True)
 
     @app_commands.command(
         name="printtty",
@@ -557,8 +685,26 @@ class ContainerControl(commands.Cog):
             return
 
         try:
-            session = await self._ensure_terminal(rec, message.channel)
-            await session.send_message_input(message.content)
+            lock = self._control_locks.setdefault(rec.thread_id, asyncio.Lock())
+            async with lock:
+                session = await self._ensure_terminal(rec, message.channel)
+                state = self._control_states.setdefault(
+                    rec.thread_id, PendingChord()
+                )
+                if state.ctrl or state.alt or state.key is not None:
+                    await session.send_pending_text(
+                        message.content,
+                        key=state.key,
+                        ctrl=state.ctrl,
+                        alt=state.alt,
+                    )
+                    state.ctrl = False
+                    state.alt = False
+                    state.key = None
+                    session.set_controls(self._control_view(rec.thread_id))
+                    await session.refresh()
+                else:
+                    await session.send_message_input(message.content)
         except Exception as e:
             log.exception("Could not send TTY input for user %s", rec.user_id)
             await message.channel.send(
@@ -609,6 +755,46 @@ class ContainerControl(commands.Cog):
             )
             return
         await interaction.followup.send("Container started.", ephemeral=True)
+
+    @app_commands.command(
+        name="restart",
+        description="Restart your container and open a fresh TTY.",
+    )
+    @app_commands.guild_only()
+    async def restart(self, interaction: discord.Interaction) -> None:
+        rec = await self._require_owner_in_thread(interaction)
+        if rec is None:
+            return
+
+        await interaction.response.defer(thinking=True, ephemeral=True)
+        await self._close_terminal(rec.thread_id)
+        try:
+            ok = await self.bot.docker.restart_container(rec.container_id)  # type: ignore[attr-defined]
+        except Exception as e:
+            await interaction.followup.send(
+                f"Could not restart the container: `{_truncate(str(e), 1000)}`",
+                ephemeral=True,
+            )
+            return
+        if not ok:
+            await self.bot.db.update_status(rec.user_id, rec.guild_id, "missing")  # type: ignore[attr-defined]
+            await interaction.followup.send("Container not found.", ephemeral=True)
+            return
+
+        await self.bot.db.update_status(rec.user_id, rec.guild_id, "running")  # type: ignore[attr-defined]
+        assert isinstance(interaction.channel, discord.Thread)
+        try:
+            self._control_states[rec.thread_id] = PendingChord()
+            session = await self._ensure_terminal(rec, interaction.channel)
+            await session.refresh()
+        except Exception as e:
+            await interaction.followup.send(
+                f"Container restarted, but the TTY could not be opened: "
+                f"`{_truncate(str(e), 1000)}`",
+                ephemeral=True,
+            )
+            return
+        await interaction.followup.send("Container restarted.", ephemeral=True)
 
     @app_commands.command(name="stop", description="Stop your container (use in your control thread).")
     @app_commands.guild_only()

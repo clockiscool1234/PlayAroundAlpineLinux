@@ -27,8 +27,14 @@ class FakeContainer:
     name = "discord-alpine-123"
     status = "running"
 
+    def __init__(self) -> None:
+        self.restart_timeout = None
+
     def reload(self):
         return None
+
+    def restart(self, *, timeout):
+        self.restart_timeout = timeout
 
 
 class FakeAPI:
@@ -111,6 +117,14 @@ class DockerManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(client.api.create_kwargs["tty"])
         self.assertEqual(client.api.start_kwargs, {"tty": True, "socket": True})
         self.assertEqual(client.api.resize, ("exec-id", 22, 80))
+
+    async def test_restart_container(self) -> None:
+        manager, client = self.manager()
+        container = FakeContainer()
+        client.containers.container = container
+
+        self.assertTrue(await manager.restart_container("container-id", timeout=7))
+        self.assertEqual(container.restart_timeout, 7)
 
 
 if __name__ == "__main__":

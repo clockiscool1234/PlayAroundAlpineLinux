@@ -170,6 +170,14 @@ class DockerManager:
         await asyncio.to_thread(_stop)
         return True
 
+    async def restart_container(self, container_id: str, timeout: int = 5) -> bool:
+        container = await self.get_container(container_id)
+        if container is None:
+            return False
+
+        await asyncio.to_thread(container.restart, timeout=timeout)
+        return True
+
     async def remove_container(self, container_id: str) -> bool:
         container = await self.get_container(container_id)
         if container is None:

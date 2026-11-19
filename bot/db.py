@@ -20,6 +20,8 @@ class UserContainer:
     terminal_columns: int = 80
     terminal_rows: int = 22
     terminal_idle_minutes: int = 10
+    terminal_rich_embed: int = 1
+    terminal_refresh_seconds: int = 3
     terminal_message_id: int | None = None
 
 
@@ -61,6 +63,8 @@ class Database:
                 terminal_columns INTEGER NOT NULL DEFAULT 80,
                 terminal_rows INTEGER NOT NULL DEFAULT 22,
                 terminal_idle_minutes INTEGER NOT NULL DEFAULT 10,
+                terminal_rich_embed INTEGER NOT NULL DEFAULT 1,
+                terminal_refresh_seconds INTEGER NOT NULL DEFAULT 3,
                 terminal_message_id INTEGER
             )
             """
@@ -80,6 +84,14 @@ class Database:
             "terminal_idle_minutes": (
                 "ALTER TABLE user_containers "
                 "ADD COLUMN terminal_idle_minutes INTEGER NOT NULL DEFAULT 10"
+            ),
+            "terminal_rich_embed": (
+                "ALTER TABLE user_containers "
+                "ADD COLUMN terminal_rich_embed INTEGER NOT NULL DEFAULT 1"
+            ),
+            "terminal_refresh_seconds": (
+                "ALTER TABLE user_containers "
+                "ADD COLUMN terminal_refresh_seconds INTEGER NOT NULL DEFAULT 3"
             ),
             "terminal_message_id": (
                 "ALTER TABLE user_containers ADD COLUMN terminal_message_id INTEGER"
@@ -160,14 +172,24 @@ class Database:
         columns: int,
         rows: int,
         idle_minutes: int,
+        rich_embed: bool,
+        refresh_seconds: int,
     ) -> None:
         await self.db.execute(
             """
             UPDATE user_containers
-            SET terminal_columns = ?, terminal_rows = ?, terminal_idle_minutes = ?
+            SET terminal_columns = ?, terminal_rows = ?, terminal_idle_minutes = ?,
+                terminal_rich_embed = ?, terminal_refresh_seconds = ?
             WHERE user_id = ?
             """,
-            (columns, rows, idle_minutes, user_id),
+            (
+                columns,
+                rows,
+                idle_minutes,
+                int(rich_embed),
+                refresh_seconds,
+                user_id,
+            ),
         )
         await self.db.commit()
 

@@ -1,0 +1,22 @@
+# One domain per line. Subdomains are blocked automatically.
+# Common public-IP / geolocation lookup services:
+api.ipify.org
+checkip.amazonaws.com
+curlmyip.net
+icanhazip.com
+ident.me
+ifconfig.co
+ifconfig.io
+ifconfig.me
+ip-api.com
+ip.sb
+ipapi.co
+ipify.org
+ipinfo.io
+ipwho.is
+myip.com
+seeip.org
+whatismyip.com
+whatismyipaddress.com
+whatsmyip.org
+wtfismyip.com

@@ -1,0 +1,12 @@
+.git
+.gitignore
+.env
+.venv
+__pycache__
+*.py[cod]
+blocklists
+network-filter
+tests
+tools
+data/*
+!data/.gitkeep

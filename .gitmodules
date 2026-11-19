@@ -1,0 +1,8 @@
+[submodule "blocklists/bad-websites"]
+	path = blocklists/bad-websites
+	url = https://github.com/elbkr/bad-websites.git
+	shallow = true
+[submodule "blocklists/Phishing.Database"]
+	path = blocklists/Phishing.Database
+	url = https://github.com/Phishing-Database/Phishing.Database.git
+	shallow = true

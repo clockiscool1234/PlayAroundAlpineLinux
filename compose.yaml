@@ -1,0 +1,51 @@
+services:
+  bot:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    depends_on:
+      network-filter:
+        condition: service_healthy
+    networks:
+      - egress
+    volumes:
+      - ./data:/app/data
+      # Docker access is required to create sibling user containers.
+      # This socket grants the bot host-level Docker control; protect the bot token.
+      - /var/run/docker.sock:/var/run/docker.sock
+
+  network-filter:
+    build: ./network-filter
+    restart: unless-stopped
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "nc", "-z", "127.0.0.1", "3128"]
+      interval: 10s
+      timeout: 2s
+      retries: 12
+      start_period: 60s
+    tmpfs:
+      - /run/squid:uid=31,gid=31,mode=0755
+      - /var/cache/squid:uid=31,gid=31,mode=0755
+    volumes:
+      - ./blocklists/bad-websites:/blocklists/bad-websites:ro
+      - ./blocklists/Phishing.Database:/blocklists/Phishing.Database:ro
+    networks:
+      filtered:
+        ipv4_address: 172.30.0.2
+      egress:
+
+networks:
+  # User containers join only this internal network. It has no host-routed
+  # Internet gateway; network-filter is their sole egress path.
+  filtered:
+    name: alpine-filtered
+    internal: true
+    ipam:
+      config:
+        - subnet: 172.30.0.0/24
+  egress:

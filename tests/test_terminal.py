@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import io
 import unittest
 
@@ -11,11 +12,15 @@ from bot.terminal import TerminalSession
 class FakeSocket:
     def __init__(self) -> None:
         self.data = bytearray()
+        self.closed = False
 
     def write(self, data) -> int:
         chunk = bytes(data)
         self.data.extend(chunk)
         return len(chunk)
+
+    def close(self) -> None:
+        self.closed = True
 
 
 class FakeRawSocket:
@@ -74,6 +79,19 @@ class TerminalInputTests(unittest.IsolatedAsyncioTestCase):
         lines = terminal.split("\n")
         self.assertEqual(len(lines), 22)
         self.assertTrue(all(len(line) == 80 for line in lines))
+
+    async def test_configured_idle_timeout_closes_only_the_tty(self) -> None:
+        session, socket = self.session()
+        session.idle_minutes = 0.0001
+        session.touch_activity()
+        session._start_idle_task()
+
+        await asyncio.sleep(0.03)
+
+        self.assertFalse(session.alive)
+        self.assertTrue(session._idle_expired)
+        self.assertTrue(socket.closed)
+        await session.close()
 
     async def test_docker_read_only_wrapper_uses_underlying_socket(self) -> None:
         session, _ = self.session()

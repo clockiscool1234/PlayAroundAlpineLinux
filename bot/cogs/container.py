@@ -419,11 +419,12 @@ class ContainerControl(commands.Cog):
 
     @app_commands.command(
         name="settings",
-        description="View or change your terminal dimensions.",
+        description="View or change terminal dimensions and idle timeout.",
     )
     @app_commands.describe(
         columns="Terminal width (20-120)",
         rows="Terminal height (5-40)",
+        idle_minutes="Disconnect an inactive TTY after this many minutes (0 disables)",
     )
     @app_commands.guild_only()
     async def settings(
@@ -431,6 +432,7 @@ class ContainerControl(commands.Cog):
         interaction: discord.Interaction,
         columns: Optional[app_commands.Range[int, 20, 120]] = None,
         rows: Optional[app_commands.Range[int, 5, 40]] = None,
+        idle_minutes: Optional[app_commands.Range[int, 0, 1440]] = None,
     ) -> None:
         rec = await self._require_owner_in_thread(interaction)
         if rec is None:
@@ -438,6 +440,11 @@ class ContainerControl(commands.Cog):
 
         new_columns = columns if columns is not None else rec.terminal_columns
         new_rows = rows if rows is not None else rec.terminal_rows
+        new_idle_minutes = (
+            idle_minutes
+            if idle_minutes is not None
+            else rec.terminal_idle_minutes
+        )
         if new_columns * new_rows > 1760:
             await interaction.response.send_message(
                 "That terminal is too large for one Discord message. "
@@ -446,9 +453,15 @@ class ContainerControl(commands.Cog):
             )
             return
 
-        if columns is None and rows is None:
+        if columns is None and rows is None and idle_minutes is None:
+            idle_description = (
+                "disabled"
+                if rec.terminal_idle_minutes == 0
+                else f"{rec.terminal_idle_minutes} minute(s)"
+            )
             await interaction.response.send_message(
-                f"Terminal size: `{rec.terminal_columns}×{rec.terminal_rows}`",
+                f"Terminal size: `{rec.terminal_columns}×{rec.terminal_rows}`\n"
+                f"Idle timeout: `{idle_description}`",
                 ephemeral=True,
             )
             return
@@ -458,24 +471,36 @@ class ContainerControl(commands.Cog):
             rec.user_id,
             columns=new_columns,
             rows=new_rows,
+            idle_minutes=new_idle_minutes,
+        )
+        dimensions_changed = (
+            new_columns != rec.terminal_columns or new_rows != rec.terminal_rows
         )
         rec.terminal_columns = new_columns
         rec.terminal_rows = new_rows
+        rec.terminal_idle_minutes = new_idle_minutes
         session = self._sessions.get(rec.thread_id)
         if session:
+            session.update_idle_timeout(new_idle_minutes)
             try:
-                await session.resize(columns=new_columns, rows=new_rows)
+                if dimensions_changed:
+                    await session.resize(columns=new_columns, rows=new_rows)
             except Exception as e:
                 log.exception("Could not resize active terminal for user %s", rec.user_id)
                 await interaction.followup.send(
-                    f"The `{new_columns}×{new_rows}` setting was saved, but the active "
+                    f"The settings were saved, but the active "
                     f"terminal could not be resized: `{_truncate(str(e), 1000)}`. "
                     "It will apply when the shell reconnects.",
                     ephemeral=True,
                 )
                 return
+        idle_description = (
+            "disabled" if new_idle_minutes == 0 else f"{new_idle_minutes} minute(s)"
+        )
         await interaction.followup.send(
-            f"Terminal resized to `{new_columns}×{new_rows}`.",
+            f"Terminal settings updated:\n"
+            f"- Size: `{new_columns}×{new_rows}`\n"
+            f"- Idle timeout: `{idle_description}`",
             ephemeral=True,
         )
 

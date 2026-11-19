@@ -88,6 +88,7 @@ class DatabaseMigrationTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNotNone(record)
             self.assertEqual(record.terminal_columns, 80)  # type: ignore[union-attr]
             self.assertEqual(record.terminal_rows, 22)  # type: ignore[union-attr]
+            self.assertEqual(record.terminal_idle_minutes, 10)  # type: ignore[union-attr]
             self.assertIsNone(record.terminal_message_id)  # type: ignore[union-attr]
             await database.close()
 

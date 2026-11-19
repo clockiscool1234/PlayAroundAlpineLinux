@@ -217,6 +217,13 @@ class DockerManager:
             exec_id = created["Id"]
             socket = self.client.api.exec_start(exec_id, tty=True, socket=True)
             try:
+                # Docker SDK inherits the HTTP client's 60-second timeout on
+                # this hijacked connection. A TTY must remain blocking; its
+                # lifecycle is managed by TerminalSession's idle timer.
+                transport = getattr(socket, "_sock", socket)
+                settimeout = getattr(transport, "settimeout", None)
+                if settimeout is not None:
+                    settimeout(None)
                 self.client.api.exec_resize(exec_id, height=rows, width=columns)
             except Exception:
                 socket.close()

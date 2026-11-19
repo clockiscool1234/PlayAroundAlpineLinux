@@ -50,7 +50,11 @@ class FakeAPI:
 
 
 class FakeSocket:
-    pass
+    def __init__(self) -> None:
+        self.timeout = "unchanged"
+
+    def settimeout(self, value) -> None:
+        self.timeout = value
 
 
 class FakeClient:
@@ -102,6 +106,7 @@ class DockerManagerTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(connection.exec_id, "exec-id")
         self.assertIsInstance(connection.socket, FakeSocket)
+        self.assertIsNone(connection.socket.timeout)
         self.assertTrue(client.api.create_kwargs["stdin"])
         self.assertTrue(client.api.create_kwargs["tty"])
         self.assertEqual(client.api.start_kwargs, {"tty": True, "socket": True})

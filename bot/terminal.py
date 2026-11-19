@@ -43,6 +43,7 @@ class TerminalSession:
         self.thread = thread
         self.columns = record.terminal_columns
         self.rows = record.terminal_rows
+        self.idle_minutes = record.terminal_idle_minutes
         self.screen = pyte.Screen(self.columns, self.rows)
         self.stream = pyte.Stream(self.screen)
         self.decoder = codecs.getincrementaldecoder("utf-8")("replace")
@@ -51,12 +52,16 @@ class TerminalSession:
         self.controls: discord.ui.View | None = None
         self.reader_task: asyncio.Task[None] | None = None
         self.render_task: asyncio.Task[None] | None = None
+        self.idle_task: asyncio.Task[None] | None = None
         self.write_lock = asyncio.Lock()
         self.message_lock = asyncio.Lock()
         self.alive = False
         self._closing = False
+        self._expected_disconnect = False
+        self._idle_expired = False
+        self._last_activity = time.monotonic()
         self._dirty = False
-        self._last_rendered: tuple[str, bool, int, int] | None = None
+        self._last_rendered: tuple[str, bool, int, int, int, bool] | None = None
 
     def set_controls(self, controls: discord.ui.View) -> None:
         self.controls = controls
@@ -74,11 +79,15 @@ class TerminalSession:
             rows=self.rows,
         )
         self.alive = True
+        self._expected_disconnect = False
+        self._idle_expired = False
+        self.touch_activity()
         loop = asyncio.get_running_loop()
         self.reader_task = asyncio.create_task(
             asyncio.to_thread(self._blocking_reader, loop),
             name=f"terminal-reader-{self.record.user_id}",
         )
+        self._start_idle_task()
         self.request_render()
 
     async def _ensure_message(self, initial: str = "") -> None:
@@ -118,7 +127,12 @@ class TerminalSession:
         window_bytes = 0
         try:
             while not self._closing:
-                data = self.connection.socket.read(4096)
+                try:
+                    data = self.connection.socket.read(4096)
+                except TimeoutError:
+                    # Some Docker transports retain an HTTP read timeout even
+                    # after settimeout(None). A quiet TTY is not disconnected.
+                    continue
                 if not data:
                     break
 
@@ -138,7 +152,7 @@ class TerminalSession:
                 loop.call_soon_threadsafe(self._feed_output, data, consumed)
                 consumed.wait()
         except Exception as exc:
-            if not self._closing:
+            if not self._closing and not self._expected_disconnect:
                 log.warning("TTY reader failed for user %s: %s", self.record.user_id, exc)
         finally:
             if not self._closing:
@@ -149,13 +163,54 @@ class TerminalSession:
             if self._closing:
                 return
             self.stream.feed(self.decoder.decode(data))
+            self.touch_activity()
             self.request_render()
         finally:
             consumed.set()
 
     def _reader_finished(self) -> None:
         self.alive = False
+        if (
+            not self._idle_expired
+            and self.idle_task
+            and not self.idle_task.done()
+        ):
+            self.idle_task.cancel()
         self.request_render()
+
+    def touch_activity(self) -> None:
+        self._last_activity = time.monotonic()
+
+    def _start_idle_task(self) -> None:
+        if self.idle_task and not self.idle_task.done():
+            self.idle_task.cancel()
+        if self.alive and self.idle_minutes > 0:
+            self.idle_task = asyncio.create_task(
+                self._idle_watchdog(),
+                name=f"terminal-idle-{self.record.user_id}",
+            )
+        else:
+            self.idle_task = None
+
+    async def _idle_watchdog(self) -> None:
+        timeout = self.idle_minutes * 60
+        while self.alive and not self._closing and timeout > 0:
+            remaining = self._last_activity + timeout - time.monotonic()
+            if remaining > 0:
+                await asyncio.sleep(remaining)
+                continue
+
+            log.info(
+                "Closing idle TTY for user %s after %s minute(s)",
+                self.record.user_id,
+                self.idle_minutes,
+            )
+            self._expected_disconnect = True
+            self._idle_expired = True
+            self.alive = False
+            await self._close_connection_socket()
+            self.request_render()
+            return
 
     def request_render(self) -> None:
         self._dirty = True
@@ -197,7 +252,13 @@ class TerminalSession:
             status = "Starting"
         else:
             colour = discord.Colour.dark_grey()
-            status = "Disconnected — next input opens a new shell"
+            status = (
+                "Idle timeout — next input opens a new shell"
+                if self._idle_expired
+                else "Disconnected — next input opens a new shell"
+            )
+
+        idle = "off" if self.idle_minutes == 0 else f"{self.idle_minutes}m"
 
         embed = discord.Embed(
             title="Alpine Linux TTY",
@@ -207,13 +268,20 @@ class TerminalSession:
         embed.set_footer(
             text=(
                 f"TTY display • {self.columns}×{self.rows} • {status} • "
-                "Toggle keys, then press Send"
+                f"Idle: {idle} • Toggle keys, then press Send"
             )
         )
         return embed
 
-    def _render_fingerprint(self) -> tuple[str, bool, int, int]:
-        return (self._screen_text(), self.alive, self.columns, self.rows)
+    def _render_fingerprint(self) -> tuple[str, bool, int, int, int, bool]:
+        return (
+            self._screen_text(),
+            self.alive,
+            self.columns,
+            self.rows,
+            self.idle_minutes,
+            self._idle_expired,
+        )
 
     async def _render(self) -> None:
         async with self.message_lock:
@@ -322,6 +390,7 @@ class TerminalSession:
                     remaining = remaining[written:]
 
             await asyncio.to_thread(_write_all)
+            self.touch_activity()
 
     async def resize(self, *, columns: int, rows: int) -> None:
         self.columns = columns
@@ -336,17 +405,46 @@ class TerminalSession:
                 rows=rows,
             )
         self._last_rendered = None
+        self.touch_activity()
         self.request_render()
+
+    def update_idle_timeout(self, minutes: int) -> None:
+        self.idle_minutes = minutes
+        self.record.terminal_idle_minutes = minutes
+        self.touch_activity()
+        self._start_idle_task()
+        self._last_rendered = None
+        self.request_render()
+
+    async def _close_connection_socket(self) -> None:
+        if self.connection is None:
+            return
+
+        socket = self.connection.socket
+
+        def _close() -> None:
+            transport = getattr(socket, "_sock", socket)
+            shutdown = getattr(transport, "shutdown", None)
+            if shutdown is not None:
+                try:
+                    shutdown(2)
+                except Exception:
+                    pass
+            socket.close()
+
+        try:
+            await asyncio.to_thread(_close)
+        except Exception:
+            pass
 
     async def close(self) -> None:
         self._closing = True
         self.alive = False
+        self._expected_disconnect = True
         if self.render_task and not self.render_task.done():
             self.render_task.cancel()
-        if self.connection is not None:
-            try:
-                await asyncio.to_thread(self.connection.socket.close)
-            except Exception:
-                pass
+        if self.idle_task and not self.idle_task.done():
+            self.idle_task.cancel()
+        await self._close_connection_socket()
         if self.reader_task and not self.reader_task.done():
             self.reader_task.cancel()

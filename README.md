@@ -11,9 +11,10 @@ This is an initial implementation designed to be extended as requirements become
 - A persistent `80×22` pseudo-terminal. Owner messages are deleted, forwarded to the TTY, and rendered into one edited rich embed.
 - ANSI cursor movement and full-screen terminal programs are interpreted with `pyte` rather than posted as raw escape codes.
 - The terminal code block is padded to exactly the configured rows and columns.
+- TTYs disconnect after 10 minutes without input or output by default; the container stays running.
 - Stateful message-component buttons for arrows, Ctrl, Alt, Esc, Tab, and sending key combinations.
 - Owner-only slash controls, usable only in the linked thread:
-  - `/settings [columns] [rows]`
+  - `/settings [columns] [rows] [idle_minutes]`
   - `/printtty`
   - `/status`
   - `/start`
@@ -37,11 +38,12 @@ Send a normal message in the private control thread to type that text followed b
 - Select one arrow, Esc, or Tab key. Selecting it again deselects it; selecting another action key replaces it.
 - Selected buttons turn blue. Press **Send** to transmit the selected key combination and clear the selection.
 - `/settings columns:80 rows:22` resizes both the Docker TTY and terminal renderer.
+- `/settings idle_minutes:10` changes the inactivity timeout per container; use `0` to disable automatic TTY disconnection.
 - `/printtty` deletes previous bot-authored TTY displays and reposts the live screen at the bottom of a crowded thread.
 
 Only the container owner can operate its terminal buttons. Discord is not a low-latency transport, but programs such as editors, pagers, and process monitors can retain terminal state and react to input.
 
-The TTY remains attached while the bot process is running. If the bot restarts, the next input opens a fresh shell in the same container; container files remain, but a foreground interactive program from the old TTY should be considered disconnected.
+The TTY remains attached until its configured inactivity timeout, an explicit stop, or a bot restart. The next input opens a fresh shell in the same container; container files remain, but a foreground interactive program from the old TTY should be considered disconnected.
 
 ## Security warning
 

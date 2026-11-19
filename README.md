@@ -55,13 +55,40 @@ User containers do not receive the Docker socket, host directories, extra capabi
 
 User containers join the `alpine-filtered` Docker network. That network is marked `internal`, so containers cannot route directly to the Internet even if a user unsets the proxy variables or changes application settings. The `network-filter` service is attached to both the internal network and a normal egress network and is the only web gateway.
 
-The bot injects `HTTP_PROXY`, `HTTPS_PROXY`, and lowercase equivalents into each new container. Squid permits HTTP and HTTPS proxy traffic on ports 80 and 443 while denying:
+The bot injects `HTTP_PROXY`, `HTTPS_PROXY`, and lowercase equivalents into each new container. With the default policy, Squid permits HTTP and HTTPS proxy traffic on ports 80 and 443 while denying:
 
 - domains from [`elbkr/bad-websites`](https://github.com/elbkr/bad-websites);
 - active phishing domains and IPs from [`Phishing-Database/Phishing.Database`](https://github.com/Phishing-Database/Phishing.Database);
 - domains in `network-filter/custom-blocked-domains.txt`, including common public-IP lookup sites;
 - literal IP destinations, which could otherwise bypass domain rules;
 - non-HTTP protocols and unsafe destination ports.
+
+Literal-IP filtering applies to proxy destinations such as `https://1.1.1.1`; it does **not** prevent normal DNS resolution. Containers use Docker's embedded resolver, and Squid resolves allowed hostnames on their behalf. Direct UDP/TCP requests to Google DNS (`8.8.8.8`) or Cloudflare DNS (`1.1.1.1`) have no route from the internal network. DNS-over-HTTPS by hostname can use the proxy unless that hostname is in a denied domain category.
+
+### Policy switches
+
+Edit `network-filter/policy.env` to set each category to `deny` or `allow`:
+
+| Variable | Default | Controls |
+|---|---|---|
+| `POLICY_BAD_WEBSITES` | `deny` | Domains from `elbkr/bad-websites` |
+| `POLICY_PHISHING_DOMAINS` | `deny` | Active Phishing.Database domains |
+| `POLICY_CUSTOM_DOMAINS` | `deny` | `custom-blocked-domains.txt` |
+| `POLICY_PHISHING_IPS` | `deny` | Active Phishing.Database IP addresses, including hostnames resolving to them |
+| `POLICY_LITERAL_IPS` | `deny` | URLs/CONNECT destinations written as IPv4 or IPv6 literals |
+| `POLICY_PRIVATE_IPS` | `deny` | Loopback, link-local, private, and reserved destination ranges |
+| `POLICY_NON_HTTP` | `deny` | CONNECT tunnels to ports other than HTTPS port 443 |
+| `POLICY_UNSAFE_PORTS` | `deny` | Destination ports outside Squid's safe-port set |
+
+`allow` means “do not deny solely because of this category”; it is not an unconditional allowlist entry. A destination is still rejected if it matches another category that remains set to `deny`. For example, allowing literal IP destinations does not allow an address in the phishing-IP feed while `POLICY_PHISHING_IPS=deny`.
+
+Apply policy changes by recreating the filter service so Compose reloads `policy.env`:
+
+```bash
+docker compose up -d --force-recreate network-filter
+```
+
+Allowing `POLICY_NON_HTTP` only permits CONNECT tunneling through Squid; it does not give containers a direct Internet route. `POLICY_UNSAFE_PORTS` continues to restrict those tunnels unless it is also allowed.
 
 The feeds are Git submodules pinned to reviewed commits. Initialize them after cloning:
 
@@ -78,7 +105,7 @@ git diff --submodule
 docker compose restart network-filter
 ```
 
-Edit `network-filter/custom-blocked-domains.txt` to add local policy entries. The filter regenerates its normalized Squid ACL files whenever the service starts.
+Edit `network-filter/custom-blocked-domains.txt` to add local policy entries. The filter regenerates its source-specific normalized Squid ACL files whenever the service starts.
 
 ### Filtering limitations
 

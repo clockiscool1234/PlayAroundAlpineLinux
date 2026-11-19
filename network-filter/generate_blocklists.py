@@ -68,25 +68,34 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--phishing-domains", type=Path, required=True)
     parser.add_argument("--phishing-ips", type=Path, required=True)
     parser.add_argument("--custom", type=Path, required=True)
-    parser.add_argument("--domains-output", type=Path, required=True)
-    parser.add_argument("--ips-output", type=Path, required=True)
+    parser.add_argument("--bad-websites-output", type=Path, required=True)
+    parser.add_argument("--phishing-domains-output", type=Path, required=True)
+    parser.add_argument("--custom-domains-output", type=Path, required=True)
+    parser.add_argument("--phishing-ips-output", type=Path, required=True)
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    domains: set[str] = set()
+    bad_domains: set[str] = set()
 
     with args.bad_websites.open(encoding="utf-8") as file:
         bad_websites = json.load(file)
     for value in bad_websites.get("links", []):
         domain = normalize_domain(str(value))
         if domain:
-            domains.add(domain)
+            bad_domains.add(domain)
 
-    add_lines(args.phishing_domains, domains)
-    add_lines(args.custom, domains)
-    domains = set(collapse_subdomains(domains))
+    phishing_domains: set[str] = set()
+    custom_domains: set[str] = set()
+    add_lines(args.phishing_domains, phishing_domains)
+    add_lines(args.custom, custom_domains)
+
+    domain_groups = {
+        args.bad_websites_output: collapse_subdomains(bad_domains),
+        args.phishing_domains_output: collapse_subdomains(phishing_domains),
+        args.custom_domains_output: collapse_subdomains(custom_domains),
+    }
 
     addresses: set[str] = set()
     for line in args.phishing_ips.read_text(
@@ -97,17 +106,20 @@ def main() -> None:
         except ValueError:
             continue
 
-    args.domains_output.write_text(
-        "".join(f".{domain}\n" for domain in sorted(domains)),
-        encoding="ascii",
-    )
-    args.ips_output.write_text(
+    for output, domains in domain_groups.items():
+        output.write_text(
+            "".join(f".{domain}\n" for domain in domains),
+            encoding="ascii",
+        )
+    args.phishing_ips_output.write_text(
         "".join(f"{address}\n" for address in sorted(addresses)),
         encoding="ascii",
     )
     print(
-        f"Generated {len(domains):,} blocked domains and "
-        f"{len(addresses):,} blocked IP addresses",
+        f"Generated {len(domain_groups[args.bad_websites_output]):,} bad-site, "
+        f"{len(domain_groups[args.phishing_domains_output]):,} phishing, and "
+        f"{len(domain_groups[args.custom_domains_output]):,} custom domains; "
+        f"plus {len(addresses):,} phishing IP addresses",
         flush=True,
     )
 

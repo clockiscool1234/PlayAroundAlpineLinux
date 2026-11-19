@@ -17,6 +17,8 @@ services:
   network-filter:
     build: ./network-filter
     restart: unless-stopped
+    env_file:
+      - ./network-filter/policy.env
     read_only: true
     cap_drop:
       - ALL

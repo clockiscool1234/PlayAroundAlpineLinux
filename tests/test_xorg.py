@@ -61,6 +61,16 @@ class XorgInputTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(session.state.ctrl)
         self.assertFalse(session.state.alt)
 
+    async def test_enter_sends_return_key(self) -> None:
+        session, docker = self.session()
+
+        await session.send_special("Return")
+
+        self.assertEqual(
+            docker.actions,
+            [["key", "--clearmodifiers", "Return"]],
+        )
+
     async def test_mouse_step_controls_relative_movement(self) -> None:
         session, docker = self.session()
         session.state.step = 100

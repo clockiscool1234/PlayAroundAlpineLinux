@@ -32,7 +32,9 @@ class TerminalComponentTests(unittest.TestCase):
                 "alpine-tty:alt",
                 "alpine-tty:escape",
                 "alpine-tty:tab",
+                "alpine-tty:enter",
                 "alpine-tty:send",
+                "alpine-tty:xorg",
             },
         )
         self.assertTrue(buttons["alpine-tty:send"].disabled)
@@ -89,6 +91,7 @@ class XorgComponentTests(unittest.TestCase):
                 "alpine-xorg:alt",
                 "alpine-xorg:escape",
                 "alpine-xorg:tab",
+                "alpine-xorg:enter",
                 "alpine-xorg:tty",
             },
         )

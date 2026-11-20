@@ -43,6 +43,8 @@ Send a normal message in the private control thread to type that text followed b
 - Click Ctrl and/or Alt to toggle modifiers.
 - Select one arrow, Esc, or Tab key. Selecting it again deselects it; selecting another action key replaces it.
 - Selected buttons turn blue. Press **Send** to transmit the selected key combination and clear the selection.
+- **Enter** sends a carriage return immediately, without needing a chord selection.
+- **Xorg** switches to the headless graphical display without closing the TTY.
 - Instead of pressing **Send**, type letters in the thread to combine them with queued buttons. Ctrl followed by `x` sends Ctrl+X; Ctrl+Alt followed by `ax` sends Ctrl+Alt+A and then `x`. Queued controls are cleared afterward and no Enter is appended.
 - `/send keys:ctrl+alt+a+x` provides the same behavior when buttons are unavailable. Supported names are `ctrl`, `alt`, `esc`, `tab`, `up`, `down`, `left`, and `right`; other tokens are sent as text.
 - `/settings columns:80 rows:22` resizes both the Docker TTY and terminal renderer.
@@ -63,10 +65,10 @@ Xorg controls provide:
 - four directional mouse buttons and selectable 100 px, 10 px, or 1 px movement;
 - toggleable left/right mouse-button holds, allowing dragging before toggling the button up again;
 - one-shot Ctrl and Alt modifiers;
-- immediate Esc and Tab keys, combined with queued Ctrl/Alt when selected;
+- immediate Esc, Tab, and Enter keys, combined with queued Ctrl/Alt when selected;
 - **Refresh** and **TTY** buttons.
 
-While Xorg is visible, a normal thread message is typed into the focused X11 window and followed by Enter. If Ctrl or Alt is queued, the modifiers apply to the first ASCII letter/number, remaining text is typed literally, no Enter is appended, and the modifiers clear. `/showtty`, the **TTY** button, or `/printtty` deletes the Xorg image and restores the still-running terminal display.
+While Xorg is visible, a normal thread message is typed into the focused X11 window and followed by Enter. If Ctrl or Alt is queued, the modifiers apply to the first ASCII letter/number, remaining text is typed literally, no Enter is appended, and the modifiers clear. `/showtty`, the **TTY** button, or `/printtty` deletes the Xorg image and restores the still-running terminal display. The **Xorg** button on the TTY message performs the reverse switch.
 
 Screenshots are event-driven rather than video streaming to avoid Discord attachment and edit rate limits. Use **Refresh** for GUI changes that occur without an input event.
 
@@ -81,6 +83,92 @@ Every fresh TTY prints the container's current `/etc/motd`. This includes a TTY 
 User files are stored in each Docker container's writable layer, not in the bot container. Docker retains that layer across bot restarts and host reboots, and each user container has an `unless-stopped` restart policy. `/stop` stops processes without deleting files; `/start` and `/restart` reuse the same writable layer. Only `/destroycontainer` intentionally removes the container and its writable-layer data.
 
 The ownership/settings database is stored at `./data/bot.db` by the Compose bind mount. Back up both Docker's data root and `./data` for disaster recovery. Docker data-root loss, manual `docker rm`, or container-pruning commands can still delete user data; this is persistence, not a backup.
+
+## Hiding the server's public IP (optional WireGuard egress)
+
+This project can send all user-container web traffic through a WireGuard VPN, so destination sites see the VPN exit IP instead of the host's public IP. It uses [Gluetun](https://github.com/qdm12/gluetun) with its built-in HTTP proxy and works with ProtonVPN or another Gluetun-supported provider.
+
+The VPN is an **egress-only** layer:
+
+- User containers still reach only Squid on the internal `alpine-filtered` network.
+- Squid forwards every request to Gluetun's authenticated HTTP proxy.
+- Gluetun sends that traffic through WireGuard.
+- If WireGuard or Gluetun is unavailable, Squid's `never_direct allow all` rule fails closed instead of revealing the host IP.
+
+### What this hides and what it does not
+
+**Hidden from destination websites:** the host's public IPv4 address for HTTP/HTTPS traffic from user containers. Forwarding headers are already removed, and Gluetun's proxy does not add its own client-identifying headers in stealth mode.
+
+**Not hidden from Discord:** the bot's Discord gateway connection uses the host's normal network path, so Discord can still see the host IP. A VPN daemon on the host could change that, but this Compose setup intentionally does not reroute the bot, Docker, SSH, or inbound services.
+
+**DNS metadata:** destination sites see the VPN IP, but some hostname lookups can still reach the host's configured resolver. That can reveal the names being queried, though not the destination-visible public IP. Gluetun resolves proxied destination names through DNS-over-TLS inside the tunnel; Squid also performs local DNS lookups for its IP-based policy ACLs, and Docker's embedded resolver handles container-local lookups.
+
+**Other traffic:** WireGuard covers web traffic through Squid, not arbitrary non-HTTP traffic, the bot's Discord connection, or host administration. It is not a full-host anonymization layer.
+
+### ProtonVPN WireGuard setup
+
+1. In the ProtonVPN dashboard, open **Downloads → WireGuard configuration** and create a configuration. Copy its `PrivateKey`.
+2. Create the two local secret files:
+
+```bash
+cp vpn.env.example vpn.env
+cp vpn-proxy.env.example vpn-proxy.env
+```
+
+3. Set the WireGuard key and exit location in `vpn.env`:
+
+```dotenv
+VPN_SERVICE_PROVIDER=protonvpn
+VPN_TYPE=wireguard
+WIREGUARD_PRIVATE_KEY=your-private-key
+SERVER_COUNTRIES=Netherlands
+```
+
+4. Set a long random internal proxy password in `vpn-proxy.env`:
+
+```dotenv
+HTTPPROXY_USER=alpinevpn
+HTTPPROXY_PASSWORD=use-a-long-random-value
+```
+
+Only letters, digits, `.`, `_`, `~`, and `-` are accepted in the internal proxy credentials. Keep both files private. `vpn.env` is mounted only into the VPN container; `network-filter` receives the proxy credentials but not the WireGuard private key. Both files are gitignored.
+
+5. Start the stack with the VPN override:
+
+```bash
+docker compose -f compose.yaml -f compose.vpn.yaml up -d --build
+```
+
+6. Watch the tunnel and filter logs:
+
+```bash
+docker compose -f compose.yaml -f compose.vpn.yaml logs -f vpn network-filter
+```
+
+Gluetun should report a successful WireGuard handshake before `network-filter` becomes healthy. User containers created earlier do not need to be recreated: they already use Squid at `172.30.0.2:3128`; only Squid's upstream changes.
+
+### Verify the exit IP
+
+Compare the host's public IP with the VPN container's:
+
+```bash
+curl -fsS https://ifconfig.me/ip
+docker compose -f compose.yaml -f compose.vpn.yaml exec vpn wget -qO- https://ifconfig.me/ip
+```
+
+The second command should show the VPN exit address, not the host address. To confirm fail-closed behavior, stop the VPN service and make a request through Squid; it should fail rather than fall back to the host:
+
+```bash
+docker compose -f compose.yaml -f compose.vpn.yaml stop vpn
+```
+
+Restart it afterward:
+
+```bash
+docker compose -f compose.yaml -f compose.vpn.yaml start vpn
+```
+
+Provider alternatives use the same `vpn.env` shape; change `VPN_SERVICE_PROVIDER`, `VPN_TYPE`, and the corresponding key fields. See Gluetun's provider documentation for provider-specific variables.
 
 ## Security warning
 
@@ -219,6 +307,12 @@ docker compose logs -f bot
 
 Compose mounts the host Docker socket so the bot can create sibling containers. User-container limits are applied by the host Docker daemon.
 
+To add the optional WireGuard egress, use the two-file Compose command described in **Hiding the server's public IP**:
+
+```bash
+docker compose -f compose.yaml -f compose.vpn.yaml up -d --build
+```
+
 ## Configuration
 
 | Variable | Default | Meaning |
@@ -230,10 +324,19 @@ Compose mounts the host Docker socket so the bot can create sibling containers. 
 | `CONTAINER_DISK` | `1g` | Hard writable-layer quota |
 | `CONTAINER_CPUS` | `1.0` | Maximum CPU cores available to a user container |
 | `CONTAINER_PIDS_LIMIT` | `128` | Maximum processes per container |
-| `CONTAINER_NETWORK` | `alpine-filtered` | Internal Docker network created by Compose |
-| `CONTAINER_HTTP_PROXY` | `http://172.30.0.2:3128` | Filtering proxy injected into user containers |
+| `CONTAINER_NETWORK_ENABLED` | `true` | Set to `false` to run user containers with no Docker network and no proxy variables |
+| `CONTAINER_NETWORK` | `alpine-filtered` | Internal Docker network created by Compose (ignored when networking is disabled) |
+| `CONTAINER_HTTP_PROXY` | `http://172.30.0.2:3128` | Filtering proxy injected into user containers (ignored when networking is disabled) |
 | `DATABASE_PATH` | `data/bot.db` | SQLite database path |
 | `USER_DEFAULTS_PATH` | `config/user-defaults.toml` | TOML defaults copied into each new user's settings |
+
+To completely disable networking for user containers, set this in `.env`:
+
+```dotenv
+CONTAINER_NETWORK_ENABLED=false
+```
+
+The bot then creates containers with Docker's `none` network mode and does not inject `HTTP_PROXY`/`HTTPS_PROXY`. Existing containers keep the network they were created with; recreate them to apply the change.
 
 ### New-user settings defaults
 
@@ -287,6 +390,9 @@ bot/cogs/container.py    Discord slash commands and ownership checks
 bot/main.py              Bot startup and command synchronization
 config/user-defaults.toml  Initial per-user terminal settings
 user-image/              Alpine user image with Xvfb/Openbox/xterm
+compose.vpn.yaml         Optional Gluetun/WireGuard egress override
+vpn.env.example          WireGuard provider/private-key template
+vpn-proxy.env.example    Internal Squid-to-Gluetun proxy credentials template
 network-filter/          Squid policy proxy and blocklist generator
 blocklists/              Pinned upstream Git submodules
 tests/                   Unit tests

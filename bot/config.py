@@ -30,6 +30,18 @@ def _get_float(name: str, default: float) -> float:
         return default
 
 
+def _get_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None or raw == "":
+        return default
+    value = raw.strip().lower()
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"0", "false", "no", "off"}:
+        return False
+    raise RuntimeError(f"{name} must be true or false, got {raw!r}")
+
+
 @dataclass(frozen=True)
 class UserSettingsDefaults:
     columns: int = 80
@@ -123,6 +135,7 @@ class Config:
     container_disk: str
     container_cpus: float
     container_pids_limit: int
+    container_network_enabled: bool
     container_network: str
     container_http_proxy: str
     database_path: Path
@@ -145,6 +158,17 @@ class Config:
             os.getenv("USER_DEFAULTS_PATH", "config/user-defaults.toml")
         )
 
+        network_enabled = _get_bool("CONTAINER_NETWORK_ENABLED", True)
+        network = os.getenv("CONTAINER_NETWORK", "alpine-filtered").strip()
+        http_proxy = os.getenv(
+            "CONTAINER_HTTP_PROXY", "http://172.30.0.2:3128"
+        ).strip()
+        if not network_enabled:
+            # No Docker network and no proxy variables: nothing can resolve or
+            # connect, including to the filtering proxy.
+            network = "none"
+            http_proxy = ""
+
         return cls(
             discord_token=token,
             guild_id=guild_id,
@@ -155,12 +179,9 @@ class Config:
             container_disk=os.getenv("CONTAINER_DISK", "1g").strip(),
             container_cpus=_get_float("CONTAINER_CPUS", 1.0),
             container_pids_limit=_get_int("CONTAINER_PIDS_LIMIT", 128),
-            container_network=os.getenv(
-                "CONTAINER_NETWORK", "alpine-filtered"
-            ).strip(),
-            container_http_proxy=os.getenv(
-                "CONTAINER_HTTP_PROXY", "http://172.30.0.2:3128"
-            ).strip(),
+            container_network_enabled=network_enabled,
+            container_network=network,
+            container_http_proxy=http_proxy,
             database_path=db_path,
             user_defaults=UserSettingsDefaults.from_toml(defaults_path),
         )

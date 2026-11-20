@@ -38,12 +38,13 @@ class TerminalControlButton(discord.ui.Button["TerminalControlView"]):
         row: int,
         selected: bool = False,
         send: bool = False,
+        enter: bool = False,
     ) -> None:
         super().__init__(
             label=label,
             style=(
                 discord.ButtonStyle.success
-                if send
+                if send or enter
                 else discord.ButtonStyle.primary
                 if selected
                 else discord.ButtonStyle.secondary
@@ -111,11 +112,26 @@ class TerminalControlView(discord.ui.View):
         )
         self.add_item(
             TerminalControlButton(
+                action="enter",
+                label="Enter",
+                row=1,
+                enter=True,
+            )
+        )
+        self.add_item(
+            TerminalControlButton(
                 action="send",
                 label="Send",
                 row=2,
                 selected=state.key is not None,
                 send=True,
+            )
+        )
+        self.add_item(
+            TerminalControlButton(
+                action="xorg",
+                label="Xorg",
+                row=2,
             )
         )
 
@@ -296,7 +312,17 @@ class ContainerControl(commands.Cog):
             lock = self._control_locks.setdefault(record.thread_id, asyncio.Lock())
             async with lock:
                 session = await self._ensure_terminal(record, interaction.channel)
-                if action == "ctrl":
+                if action == "xorg":
+                    await session.hide_message()
+                    try:
+                        await self._ensure_xorg(record, interaction.channel)
+                    except Exception:
+                        await session.show_message()
+                        raise
+                    return
+                if action == "enter":
+                    await session.write(b"\r")
+                elif action == "ctrl":
                     state.ctrl = not state.ctrl
                 elif action == "alt":
                     state.alt = not state.alt
@@ -371,6 +397,8 @@ class ContainerControl(commands.Cog):
                     await session.send_special("Escape")
                 elif action == "tab":
                     await session.send_special("Tab")
+                elif action == "enter":
+                    await session.send_special("Return")
                 elif action == "tty":
                     await self._show_tty_display(record, interaction.channel)
                     return
@@ -546,6 +574,8 @@ class ContainerControl(commands.Cog):
             "- `/destroycontainer` - permanently delete the container and its data\n\n"
             "Use the buttons below the terminal to select arrows, Ctrl, Alt, "
             "Esc, or Tab, then press **Send** to transmit the combination. "
+            "**Enter** sends a carriage return immediately, and **Xorg** switches "
+            "to the graphical display. "
             "You can also toggle modifiers and send letters as a normal message.\n\n"
             "The terminal runs as root in `/root` and stays up until you stop/destroy it."
         )

@@ -107,7 +107,12 @@ class XorgControlView(discord.ui.View):
             )
         )
 
-        for action, label in (("escape", "Esc"), ("tab", "Tab"), ("tty", "TTY")):
+        for action, label in (
+            ("escape", "Esc"),
+            ("tab", "Tab"),
+            ("enter", "Enter"),
+            ("tty", "TTY"),
+        ):
             self.add_item(
                 XorgControlButton(action=action, label=label, row=3)
             )

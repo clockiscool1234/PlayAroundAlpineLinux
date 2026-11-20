@@ -7,10 +7,36 @@ from docker.errors import NotFound
 from bot.docker_manager import DockerManager
 
 
+class FakeProbe:
+    def __init__(
+        self,
+        status: int = 1,
+        logs: bytes = b"dd: /disk-probe.bin: No space left on device",
+    ) -> None:
+        self.status = status
+        self.logs_data = logs
+        self.removed = False
+        self.wait_timeout = None
+
+    def wait(self, timeout=None):
+        self.wait_timeout = timeout
+        return {"StatusCode": self.status}
+
+    def logs(self):
+        return self.logs_data
+
+    def remove(self, force=False):
+        self.removed = True
+
+
 class FakeContainers:
     def __init__(self) -> None:
         self.run_kwargs = None
         self.container = None
+        self.probe = FakeProbe()
+        self.probe_kwargs = None
+        self.container_result = FakeContainer()
+        self.run_count = 0
 
     def get(self, identifier):
         if self.container is None:
@@ -18,8 +44,12 @@ class FakeContainers:
         return self.container
 
     def run(self, **kwargs):
+        self.run_count += 1
+        if kwargs.get("storage_opt", {}).get("size") == "8m":
+            self.probe_kwargs = kwargs
+            return self.probe
         self.run_kwargs = kwargs
-        return FakeContainer()
+        return self.container_result
 
 
 class FakeContainer:
@@ -27,14 +57,18 @@ class FakeContainer:
     name = "discord-alpine-123"
     status = "running"
 
-    def __init__(self) -> None:
+    def __init__(self, storage_size: str = "1g") -> None:
         self.restart_timeout = None
+        self.attrs = {"HostConfig": {"StorageOpt": {"size": storage_size}}}
 
     def reload(self):
         return None
 
     def restart(self, *, timeout):
         self.restart_timeout = timeout
+
+    def remove(self, force=False):
+        return None
 
 
 class FakeAPI:
@@ -69,6 +103,13 @@ class FakeClient:
     def __init__(self) -> None:
         self.containers = FakeContainers()
         self.api = FakeAPI()
+        self.info_data = {
+            "Driver": "overlay2",
+            "DriverStatus": [["Backing Filesystem", "xfs"]],
+        }
+
+    def info(self):
+        return self.info_data
 
 
 class DockerManagerTests(unittest.IsolatedAsyncioTestCase):
@@ -105,6 +146,58 @@ class DockerManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(kwargs["cap_drop"], ["ALL"])
         self.assertEqual(kwargs["security_opt"], ["no-new-privileges:true"])
         self.assertEqual(kwargs["restart_policy"], {"Name": "unless-stopped"})
+        self.assertEqual(
+            client.containers.probe_kwargs["storage_opt"],
+            {"size": "8m"},
+        )
+        self.assertTrue(client.containers.probe.removed)
+
+    async def test_disk_quota_rejects_non_xfs_overlay(self) -> None:
+        manager, client = self.manager()
+        client.info_data = {
+            "Driver": "overlay2",
+            "DriverStatus": [["Backing Filesystem", "extfs"]],
+        }
+
+        with self.assertRaisesRegex(RuntimeError, "backed by extfs"):
+            await manager.ensure_disk_quota()
+
+        self.assertEqual(client.containers.run_count, 0)
+
+    async def test_disk_quota_probe_rejects_unenforced_quota(self) -> None:
+        manager, client = self.manager()
+        client.containers.probe.status = 0
+        client.containers.probe.logs_data = b""
+
+        with self.assertRaisesRegex(RuntimeError, "did not enforce"):
+            await manager.ensure_disk_quota()
+
+        self.assertTrue(client.containers.probe.removed)
+
+    async def test_disk_quota_probe_rejects_unrelated_failure(self) -> None:
+        manager, client = self.manager()
+        client.containers.probe.status = 1
+        client.containers.probe.logs_data = b"dd: can't open '/disk-probe.bin'"
+
+        with self.assertRaisesRegex(RuntimeError, "could not verify"):
+            await manager.ensure_disk_quota()
+
+    async def test_create_refuses_after_quota_verification_failure(self) -> None:
+        manager, client = self.manager()
+        manager._disk_quota_checked = True
+        manager._disk_quota_error = "quota is not supported"
+
+        with self.assertRaisesRegex(RuntimeError, "quota is not supported"):
+            await manager.create_container(guild_id=5, user_id=123)
+
+        self.assertEqual(client.containers.run_count, 0)
+
+    async def test_create_rejects_container_without_requested_quota(self) -> None:
+        manager, client = self.manager()
+        client.containers.container_result = FakeContainer(storage_size="")
+
+        with self.assertRaisesRegex(RuntimeError, "without the requested"):
+            await manager.create_container(guild_id=5, user_id=123)
 
     async def test_terminal_uses_requested_pty_size(self) -> None:
         manager, client = self.manager()

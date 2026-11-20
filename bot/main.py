@@ -43,6 +43,7 @@ class AlpineBot(commands.Bot):
         try:
             await self.docker.ensure_image()
             await self.docker.ensure_network()
+            await self.docker.ensure_disk_quota()
         except Exception as e:
             log.warning("Docker prerequisite check failed: %s", e)
 

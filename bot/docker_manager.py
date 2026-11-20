@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import uuid
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -38,6 +39,9 @@ class DockerManager:
         self.network_mode = network_mode
         self.http_proxy = http_proxy
         self._client: Optional[docker.DockerClient] = None
+        self._disk_quota_lock = asyncio.Lock()
+        self._disk_quota_checked = False
+        self._disk_quota_error: str | None = None
 
     @property
     def client(self) -> docker.DockerClient:
@@ -73,7 +77,134 @@ class DockerManager:
 
         await asyncio.to_thread(_inspect)
 
+    async def ensure_disk_quota(self) -> None:
+        """Prove the daemon actually enforces a writable-layer size quota.
+
+        Docker only honours ``storage_opt size`` for overlay2 on XFS with
+        pquota (and for btrfs/zfs). On ext4/overlay2 the option can be accepted
+        and then ignored, which silently gives every user an unlimited disk.
+        The probe writes past a small quota and treats success as a failure.
+        """
+        if self._disk_quota_checked:
+            if self._disk_quota_error:
+                raise RuntimeError(self._disk_quota_error)
+            return
+
+        async with self._disk_quota_lock:
+            if self._disk_quota_checked:
+                if self._disk_quota_error:
+                    raise RuntimeError(self._disk_quota_error)
+                return
+
+            try:
+                message = await self._probe_disk_quota()
+            except Exception as error:
+                self._disk_quota_error = str(error)
+                raise
+            else:
+                self._disk_quota_error = None
+                log.info("%s", message)
+            finally:
+                self._disk_quota_checked = True
+
+    async def _probe_disk_quota(self) -> str:
+        if not self.disk:
+            raise RuntimeError(
+                "CONTAINER_DISK must be set to enforce a disk quota"
+            )
+
+        def _detect_backing() -> str | None:
+            info = self.client.info()
+            driver = str(info.get("Driver") or "").lower()
+            status = dict(info.get("DriverStatus") or [])
+            backing = str(status.get("Backing Filesystem") or "").strip()
+            if driver == "overlay2" and backing and backing.lower() != "xfs":
+                return backing
+            return None
+
+        try:
+            backing = await asyncio.to_thread(_detect_backing)
+        except Exception as error:
+            raise RuntimeError(
+                "Could not inspect the Docker storage driver before "
+                f"verifying disk quotas: {error}"
+            ) from error
+        if backing:
+            raise RuntimeError(
+                "Docker overlay2 is backed by "
+                f"{backing}, which cannot enforce per-container disk quotas. "
+                "Move the Docker data root to XFS mounted with pquota "
+                "(or use btrfs/zfs with quotas). The bot refuses to create "
+                "an unlimited user container."
+            )
+
+        name = f"alpine-disk-quota-probe-{uuid.uuid4().hex[:12]}"
+        probe_quota = "8m"
+        write_megabytes = 16
+
+        def _probe() -> tuple[int, bytes]:
+            container = self.client.containers.run(
+                image=self.image,
+                name=name,
+                command=[
+                    "/bin/sh",
+                    "-c",
+                    "dd if=/dev/zero of=/disk-probe.bin "
+                    f"bs=1M count={write_megabytes}",
+                ],
+                detach=True,
+                remove=False,
+                network_mode="none",
+                mem_limit="64m",
+                pids_limit=16,
+                cap_drop=["ALL"],
+                security_opt=["no-new-privileges:true"],
+                storage_opt={"size": probe_quota},
+            )
+            try:
+                result = container.wait(timeout=60)
+                return int(result.get("StatusCode", -1)), container.logs()
+            finally:
+                try:
+                    container.remove(force=True)
+                except Exception:
+                    log.warning("Failed to remove disk quota probe %s", name)
+
+        try:
+            status, logs = await asyncio.to_thread(_probe)
+        except Exception as error:
+            raise RuntimeError(
+                "Docker could not create a container with a writable-layer "
+                "size quota. The bot refuses to create an unlimited user "
+                "container. Use a quota-capable Docker data root: overlay2 "
+                "on XFS mounted with pquota (or btrfs/zfs with quotas). "
+                f"Docker error: {error}"
+            ) from error
+
+        output = logs.decode("utf-8", errors="replace").strip()
+        if status == 0:
+            raise RuntimeError(
+                "Docker did not enforce the writable-layer disk quota: a "
+                f"probe wrote {write_megabytes} MB inside a {probe_quota} "
+                "limit. Check that the Docker data root is on XFS mounted "
+                "with pquota (or another quota-capable storage driver), then "
+                "restart the bot."
+            )
+
+        lowered = output.lower()
+        if "no space left" not in lowered and "disk quota" not in lowered:
+            raise RuntimeError(
+                "Docker could not verify the writable-layer disk quota. The "
+                f"probe exited with status {status}: "
+                f"{output[:500] or '(no output)'}"
+            )
+
+        return (
+            f"Disk quota verified: docker rejected writes past {probe_quota}"
+        )
+
     async def create_container(self, guild_id: int, user_id: int) -> Container:
+        await self.ensure_disk_quota()
         name = self._container_name(user_id)
 
         def _create() -> Container:
@@ -115,10 +246,26 @@ class DockerManager:
             # writable layer. overlay2 typically requires XFS with project quotas.
             if not self.disk:
                 raise RuntimeError("CONTAINER_DISK must be set to enforce a disk quota")
-            return self.client.containers.run(
+            container = self.client.containers.run(
                 **kwargs,
                 storage_opt={"size": self.disk},
             )
+            attrs = getattr(container, "attrs", {}) or {}
+            storage_opt = (attrs.get("HostConfig") or {}).get("StorageOpt") or {}
+            actual = storage_opt.get("size")
+            if (actual or "").lower() != self.disk.lower():
+                try:
+                    container.remove(force=True)
+                except Exception:
+                    log.warning(
+                        "Failed to remove container without a disk quota: %s",
+                        getattr(container, "id", "unknown"),
+                    )
+                raise RuntimeError(
+                    "Docker created the user container without the requested "
+                    f"disk quota (requested {self.disk!r}, got {actual!r})."
+                )
+            return container
 
         return await asyncio.to_thread(_create)
 

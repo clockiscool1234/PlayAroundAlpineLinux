@@ -247,13 +247,48 @@ Existing containers retain their creation-time network and environment settings.
 
 ### Disk quota prerequisite
 
-The bot deliberately fails closed if the 1 GiB disk quota cannot be applied. With `overlay2`, Docker commonly requires an XFS backing filesystem mounted with project quotas (`pquota`/`prjquota`). Check your daemon with:
+`CONTAINER_DISK` is a hard limit only when Docker's storage driver actually enforces per-container quotas. `overlay2` supports `--storage-opt size` only when its data root is on XFS mounted with project quotas (`pquota`/`prjquota`); btrfs and zfs also support quotas. On ext4/overlay2, Docker does not provide a writable-layer size clamp, and a container can fill the host disk even with `CONTAINER_DISK=1g`.
+
+The bot verifies this at startup and again before creating a container:
+
+- It first checks `docker info`; `overlay2` on a non-XFS backing filesystem is rejected immediately.
+- It then creates a throwaway container with an 8 MiB writable-layer limit and writes 16 MiB to it.
+- If the write succeeds, Docker did not enforce the quota. The bot logs the reason and refuses to create user containers.
+- If Docker fails with `No space left on device`, the quota is working.
+
+Check the daemon manually:
 
 ```bash
 docker info
+docker run --rm --storage-opt size=8m alpine:3.20 \
+  sh -c 'dd if=/dev/zero of=/probe bs=1M count=16'
 ```
 
-If `docker run --storage-opt size=1g alpine:3.20 true` reports that `size` is unsupported, configure a quota-capable Docker data root/storage driver before using the bot. The project will not silently launch an unlimited container.
+The second command must fail with `No space left on device`. If it succeeds, fix the host before using the bot.
+
+#### Configure a quota-capable data root
+
+This is a host-level change. Back up existing Docker data first; changing the data root makes existing images and containers inaccessible. A dedicated XFS partition or volume mounted at `/var/lib/docker` is the most reliable option. The mount must include project quotas:
+
+```bash
+# /etc/fstab example:
+# UUID=<uuid> /var/lib/docker xfs defaults,pquota 0 0
+sudo mount -o remount,pquota /var/lib/docker
+```
+
+For a disposable or test host, a loopback XFS image also works:
+
+```bash
+sudo systemctl stop docker
+sudo truncate -s 200G /var/lib/docker-xfs.img
+sudo mkfs.xfs -n ftype=1 /var/lib/docker-xfs.img
+sudo mount -o loop,pquota /var/lib/docker-xfs.img /var/lib/docker
+sudo systemctl start docker
+```
+
+Verify that `docker info` reports `Storage Driver: overlay2` and `Backing Filesystem: xfs`, then run the `--storage-opt size=8m` probe above. Add the mount to `/etc/fstab` so it survives reboots.
+
+Existing containers keep the storage options they were created with. Recreate them after fixing the host; the bot cannot retroactively add a quota to a container created without one.
 
 ## Discord setup
 
@@ -321,7 +356,7 @@ docker compose -f compose.yaml -f compose.vpn.yaml up -d --build
 | `GUILD_ID` | unset | Test guild for immediate command sync; unset means global sync |
 | `CONTAINER_IMAGE` | `playaround-alpine-xorg:3.20` | Locally built Alpine image with headless Xorg tools |
 | `CONTAINER_MEMORY` | `512m` | Docker memory and memory+swap limit |
-| `CONTAINER_DISK` | `1g` | Hard writable-layer quota |
+| `CONTAINER_DISK` | `1g` | Hard writable-layer quota; creation is refused unless the daemon's quota probe succeeds |
 | `CONTAINER_CPUS` | `1.0` | Maximum CPU cores available to a user container |
 | `CONTAINER_PIDS_LIMIT` | `128` | Maximum processes per container |
 | `CONTAINER_NETWORK_ENABLED` | `true` | Set to `false` to run user containers with no Docker network and no proxy variables |

@@ -249,7 +249,7 @@ Existing containers retain their creation-time network and environment settings.
 
 `CONTAINER_DISK` is a hard limit only when Docker's storage driver actually enforces per-container quotas. `overlay2` supports `--storage-opt size` only when its data root is on XFS mounted with project quotas (`pquota`/`prjquota`); btrfs and zfs also support quotas. On ext4/overlay2, Docker does not provide a writable-layer size clamp, and a container can fill the host disk even with `CONTAINER_DISK=1g`.
 
-The bot verifies this at startup and again before creating a container:
+The bot verifies this at startup and remembers the result. Container creation is refused if the check failed.
 
 - It first checks `docker info`; `overlay2` on a non-XFS backing filesystem is rejected immediately.
 - It then creates a throwaway container with an 8 MiB writable-layer limit and writes 16 MiB to it.

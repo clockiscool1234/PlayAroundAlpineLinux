@@ -1,0 +1,43 @@
+# Optional WireGuard egress for user-container web traffic.
+#
+# Usage:
+#   cp vpn.env.example vpn.env
+#   cp vpn-proxy.env.example vpn-proxy.env
+#   # fill in the ProtonVPN WireGuard key and proxy credentials
+#   docker compose -f compose.yaml -f compose.vpn.yaml up -d --build
+#
+# The bot and its Discord gateway connection still use the host's normal
+# network path. Only network-filter's upstream HTTP traffic is sent through
+# Gluetun. If WireGuard is down, Squid fails closed through never_direct.
+
+services:
+  vpn:
+    image: qmcgaw/gluetun:latest
+    restart: unless-stopped
+    env_file:
+      - ./vpn.env
+      - ./vpn-proxy.env
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    environment:
+      # HTTP proxy is available only on the Compose egress network.
+      HTTPPROXY: "on"
+      HTTPPROXY_LISTENING_ADDRESS: ":8888"
+      HTTPPROXY_STEALTH: "on"
+      FIREWALL_INPUT_PORTS: "8888"
+      # Resolve names through the tunnel using DNS-over-TLS.
+      DOT: "on"
+    networks:
+      - egress
+
+  network-filter:
+    env_file:
+      - ./network-filter/policy.env
+      - ./vpn-proxy.env
+    environment:
+      VPN_UPSTREAM_PROXY: "vpn:8888"
+    depends_on:
+      vpn:
+        condition: service_healthy

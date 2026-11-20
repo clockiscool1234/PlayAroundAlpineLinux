@@ -2,6 +2,8 @@ __pycache__/
 *.py[cod]
 *.pyo
 .env
+vpn.env
+vpn-proxy.env
 .venv/
 venv/
 data/*

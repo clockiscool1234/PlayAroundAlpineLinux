@@ -50,6 +50,8 @@ add_policy POLICY_PHISHING_DOMAINS "$POLICY_PHISHING_DOMAINS" "http_access deny 
 add_policy POLICY_CUSTOM_DOMAINS "$POLICY_CUSTOM_DOMAINS" "http_access deny custom_domains"
 add_policy POLICY_PHISHING_IPS "$POLICY_PHISHING_IPS" "http_access deny phishing_ips"
 
+/usr/local/bin/configure-upstream /run/squid/upstream.conf
+
 printf '%s\n' \
   "Loaded network policy:" \
   "  POLICY_BAD_WEBSITES=$POLICY_BAD_WEBSITES" \

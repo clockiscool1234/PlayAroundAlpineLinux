@@ -164,6 +164,18 @@ class DockerManagerTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(client.containers.run_count, 0)
 
+    async def test_disk_quota_rejects_containerd_image_store(self) -> None:
+        manager, client = self.manager()
+        client.info_data = {
+            "Driver": "overlayfs",
+            "DriverStatus": [["driver-type", "io.containerd.snapshotter.v1"]],
+        }
+
+        with self.assertRaisesRegex(RuntimeError, "containerd image store"):
+            await manager.ensure_disk_quota()
+
+        self.assertEqual(client.containers.run_count, 0)
+
     async def test_disk_quota_probe_rejects_unenforced_quota(self) -> None:
         manager, client = self.manager()
         client.containers.probe.status = 0

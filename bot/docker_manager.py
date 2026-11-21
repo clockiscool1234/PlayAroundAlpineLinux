@@ -80,10 +80,11 @@ class DockerManager:
     async def ensure_disk_quota(self) -> None:
         """Prove the daemon actually enforces a writable-layer size quota.
 
-        Docker only honours ``storage_opt size`` for overlay2 on XFS with
-        pquota (and for btrfs/zfs). On ext4/overlay2 the option can be accepted
-        and then ignored, which silently gives every user an unlimited disk.
-        The probe writes past a small quota and treats success as a failure.
+        Docker only honours ``storage_opt size`` for the classic overlay2
+        graph driver on XFS with pquota (and for btrfs/zfs). ext4/overlay2
+        and Docker 29's containerd image store accept the option and then
+        ignore it, which silently gives every user an unlimited disk. The
+        probe writes past a small quota and treats success as a failure.
         """
         if self._disk_quota_checked:
             if self._disk_quota_error:
@@ -113,23 +114,37 @@ class DockerManager:
                 "CONTAINER_DISK must be set to enforce a disk quota"
             )
 
-        def _detect_backing() -> str | None:
+        def _inspect_storage() -> tuple[str, str, str]:
             info = self.client.info()
-            driver = str(info.get("Driver") or "").lower()
+            driver = str(info.get("Driver") or "").strip().lower()
             status = dict(info.get("DriverStatus") or [])
+            driver_type = str(status.get("driver-type") or "").strip().lower()
             backing = str(status.get("Backing Filesystem") or "").strip()
-            if driver == "overlay2" and backing and backing.lower() != "xfs":
-                return backing
-            return None
+            return driver, driver_type, backing
 
         try:
-            backing = await asyncio.to_thread(_detect_backing)
+            driver, driver_type, backing = await asyncio.to_thread(
+                _inspect_storage
+            )
         except Exception as error:
             raise RuntimeError(
                 "Could not inspect the Docker storage driver before "
                 f"verifying disk quotas: {error}"
             ) from error
-        if backing:
+
+        if driver == "overlayfs" or driver_type.startswith("io.containerd."):
+            raise RuntimeError(
+                "Docker is using the containerd image store (Storage Driver: "
+                "overlayfs), which ignores --storage-opt size. Disable it by "
+                'setting "features": {"containerd-snapshotter": false} (and '
+                'optionally "storage-driver": "overlay2") in '
+                "/etc/docker/daemon.json, restart Docker, and confirm that "
+                "`docker info` reports Storage Driver: overlay2 with "
+                "Backing Filesystem: xfs. The bot refuses to create an "
+                "unlimited user container."
+            )
+
+        if driver == "overlay2" and backing and backing.lower() != "xfs":
             raise RuntimeError(
                 "Docker overlay2 is backed by "
                 f"{backing}, which cannot enforce per-container disk quotas. "
@@ -186,9 +201,9 @@ class DockerManager:
             raise RuntimeError(
                 "Docker did not enforce the writable-layer disk quota: a "
                 f"probe wrote {write_megabytes} MB inside a {probe_quota} "
-                "limit. Check that the Docker data root is on XFS mounted "
-                "with pquota (or another quota-capable storage driver), then "
-                "restart the bot."
+                f"limit while using storage driver {driver!r}. Check that "
+                "the Docker data root is on XFS mounted with pquota (or "
+                "another quota-capable storage driver), then restart the bot."
             )
 
         lowered = output.lower()

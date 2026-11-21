@@ -251,7 +251,7 @@ Existing containers retain their creation-time network and environment settings.
 
 The bot verifies this at startup and remembers the result. Container creation is refused if the check failed.
 
-- It first checks `docker info`; `overlay2` on a non-XFS backing filesystem is rejected immediately.
+- It first checks `docker info`; `overlay2` on a non-XFS backing filesystem is rejected immediately, as is Docker 29's containerd image store (`Storage Driver: overlayfs`) with instructions to disable it.
 - It then creates a throwaway container with an 8 MiB writable-layer limit and writes 16 MiB to it.
 - If the write succeeds, Docker did not enforce the quota. The bot logs the reason and refuses to create user containers.
 - If Docker fails with `No space left on device`, the quota is working.
@@ -259,12 +259,37 @@ The bot verifies this at startup and remembers the result. Container creation is
 Check the daemon manually:
 
 ```bash
-docker info
+docker info | grep -E 'Storage Driver|Backing Filesystem|driver-type'
 docker run --rm --storage-opt size=8m alpine:3.20 \
   sh -c 'dd if=/dev/zero of=/probe bs=1M count=16'
 ```
 
-The second command must fail with `No space left on device`. If it succeeds, fix the host before using the bot.
+The first command must show `Storage Driver: overlay2` and `Backing Filesystem: xfs`, with no `driver-type: io.containerd.snapshotter.v1`. The second command must fail with `No space left on device`. If it succeeds, fix the host before using the bot.
+
+#### Docker 29 and the containerd image store
+
+Docker Engine 29 uses the containerd image store by default on fresh installs. It reports `Storage Driver: overlayfs` and `driver-type: io.containerd.snapshotter.v1`, ignores `--storage-opt size`, and keeps snapshots under `/var/lib/containerd`. An XFS mount at `/var/lib/docker` is therefore not in the container write path.
+
+Switch back to the classic graph driver in `/etc/docker/daemon.json`:
+
+```json
+{
+  "features": {
+    "containerd-snapshotter": false
+  },
+  "storage-driver": "overlay2"
+}
+```
+
+Merge these keys with any existing configuration, then:
+
+```bash
+sudo dockerd --validate --config-file=/etc/docker/daemon.json
+sudo systemctl restart docker
+docker info | grep -E 'Storage Driver|Backing Filesystem|driver-type'
+```
+
+The validation must print `configuration OK`, and `docker info` must show `overlay2` and `xfs` with no `driver-type` line. Switching storage backends hides images and containers created with the other backend; rebuild with `docker compose up -d --build`, then rerun the probe above.
 
 #### Configure a quota-capable data root
 

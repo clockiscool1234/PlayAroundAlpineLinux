@@ -1,10 +1,16 @@
 # Optional WireGuard egress for user-container web traffic.
 #
-# Usage:
-#   cp vpn.env.example vpn.env
-#   cp vpn-proxy.env.example vpn-proxy.env
-#   # fill in the ProtonVPN WireGuard key and proxy credentials
-#   docker compose -f compose.yaml -f compose.vpn.yaml up -d --build
+# 1. In ProtonVPN, open Downloads -> WireGuard configuration and create a
+#    configuration for the exit server you want.
+# 2. Save the downloaded .conf as ./protonvpn.conf (gitignored, chmod 600).
+# 3. cp vpn-proxy.env.example vpn-proxy.env
+#    # fill in the internal Squid-to-Gluetun proxy credentials
+# 4. docker compose -f compose.yaml -f compose.vpn.yaml up -d --build
+#
+# Gluetun reads PrivateKey, Address, PublicKey, Endpoint, and optional
+# PresharedKey from protonvpn.conf. It does not read DNS, AllowedIPs, or
+# PersistentKeepalive from that file, so the environment below supplies the
+# keepalive and Gluetun keeps its own DNS-over-TLS and full-tunnel defaults.
 #
 # The bot and its Discord gateway connection still use the host's normal
 # network path. Only network-filter's upstream HTTP traffic is sent through
@@ -15,13 +21,20 @@ services:
     image: qmcgaw/gluetun:latest
     restart: unless-stopped
     env_file:
-      - ./vpn.env
       - ./vpn-proxy.env
+    volumes:
+      - ./protonvpn.conf:/gluetun/wireguard/wg0.conf:ro
     cap_add:
       - NET_ADMIN
     devices:
       - /dev/net/tun:/dev/net/tun
     environment:
+      # A mounted wg0.conf is used with the custom provider.
+      VPN_SERVICE_PROVIDER: "custom"
+      VPN_TYPE: "wireguard"
+      # ProtonVPN writes PersistentKeepalive = 25; Gluetun ignores that INI
+      # field, so apply the same value here.
+      WIREGUARD_PERSISTENT_KEEPALIVE_INTERVAL: "25s"
       # HTTP proxy is available only on the Compose egress network.
       HTTPPROXY: "on"
       HTTPPROXY_LISTENING_ADDRESS: ":8888"

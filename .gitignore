@@ -4,6 +4,7 @@ __pycache__/
 .env
 vpn.env
 vpn-proxy.env
+protonvpn.conf
 .venv/
 venv/
 data/*

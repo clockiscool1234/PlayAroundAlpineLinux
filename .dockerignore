@@ -1,6 +1,9 @@
 .git
 .gitignore
 .env
+vpn.env
+vpn-proxy.env
+protonvpn.conf
 .venv
 __pycache__
 *.py[cod]

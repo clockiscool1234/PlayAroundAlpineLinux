@@ -569,6 +569,8 @@ class ContainerControl(commands.Cog):
             "- `/reset` and `/refresh` - reset or redraw the TTY\n"
             "- `/showxorg` and `/showtty` - switch between GUI and terminal displays\n"
             "- `/printtty` - move the current terminal display to the bottom\n"
+            "- `/tmate` - open an SSH-accessible session (run `/tmate stop:true` to close it)\n"
+            "- `/limits` - show the Docker-enforced memory, CPU, PID, and disk limits\n"
             "- `/status` - show container status\n"
             "- `/start`, `/stop`, `/restart` - container lifecycle\n"
             "- `/destroycontainer` - permanently delete the container and its data\n\n"
@@ -945,6 +947,123 @@ class ContainerControl(commands.Cog):
                 f"Input was not executed because the active display is unavailable: "
                 f"`{_truncate(str(e), 1200)}`"
             )
+
+    @app_commands.command(
+        name="tmate",
+        description="Start an SSH-accessible tmate session for this container.",
+    )
+    @app_commands.describe(
+        stop="Stop the existing tmate session instead of starting one",
+    )
+    @app_commands.guild_only()
+    async def tmate(
+        self, interaction: discord.Interaction, stop: bool = False
+    ) -> None:
+        rec = await self._require_owner_in_thread(interaction)
+        if rec is None:
+            return
+
+        await interaction.response.defer(thinking=True, ephemeral=True)
+        try:
+            output = await self.bot.docker.tmate_session(  # type: ignore[attr-defined]
+                rec.container_id, stop=stop
+            )
+        except Exception as e:
+            log.exception("tmate failed for user %s", rec.user_id)
+            await interaction.followup.send(
+                f"tmate failed: `{_truncate(str(e), 1200)}`",
+                ephemeral=True,
+            )
+            return
+
+        if stop:
+            await interaction.followup.send("tmate session stopped.", ephemeral=True)
+            return
+        if not output:
+            await interaction.followup.send(
+                "tmate started but did not return an SSH command. "
+                "Run `/tmate stop:true`, then try again.",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.followup.send(
+            "SSH into your container with:\n"
+            f"```\n{_truncate(output, 1500)}\n```\n"
+            "Anyone with this command gets a root shell in your container. "
+            "Keep it private. Run `/tmate stop:true` to close the session.",
+            ephemeral=True,
+        )
+
+    @app_commands.command(
+        name="limits",
+        description="Show the limits Docker enforces on your container.",
+    )
+    @app_commands.guild_only()
+    async def limits(self, interaction: discord.Interaction) -> None:
+        rec = await self._require_owner_in_thread(interaction)
+        if rec is None:
+            return
+
+        await interaction.response.defer(thinking=True, ephemeral=True)
+        try:
+            limits = await self.bot.docker.container_limits(rec.container_id)  # type: ignore[attr-defined]
+        except Exception as e:
+            log.exception("Could not read limits for user %s", rec.user_id)
+            await interaction.followup.send(
+                f"Could not read container limits: `{_truncate(str(e), 1200)}`",
+                ephemeral=True,
+            )
+            return
+
+        try:
+            cgroup = await self.bot.docker.run_command(  # type: ignore[attr-defined]
+                rec.container_id,
+                [
+                    "/bin/sh",
+                    "-c",
+                    "if [ -r /sys/fs/cgroup/memory.max ]; then "
+                    "echo \"cgroup memory.max: $(cat /sys/fs/cgroup/memory.max)\"; "
+                    "else echo \"cgroup memory.limit_in_bytes: "
+                    "$(cat /sys/fs/cgroup/memory/memory.limit_in_bytes 2>/dev/null || echo unknown)\"; "
+                    "fi; "
+                    "if [ -r /sys/fs/cgroup/cpu.max ]; then "
+                    "echo \"cgroup cpu.max: $(cat /sys/fs/cgroup/cpu.max)\"; "
+                    "else echo \"cgroup cpu.cfs_quota_us: "
+                    "$(cat /sys/fs/cgroup/cpu/cpu.cfs_quota_us 2>/dev/null || echo unknown) / "
+                    "$(cat /sys/fs/cgroup/cpu/cpu.cfs_period_us 2>/dev/null || echo unknown)\"; "
+                    "fi; "
+                    "if [ -r /sys/fs/cgroup/pids.max ]; then "
+                    "echo \"cgroup pids.max: $(cat /sys/fs/cgroup/pids.max)\"; "
+                    "fi",
+                ],
+                max_output=16 * 1024,
+            )
+            cgroup_text = cgroup.decode("utf-8", errors="replace").strip()
+        except Exception as e:
+            cgroup_text = f"container is not running; cgroup values unavailable ({_truncate(str(e), 300)})"
+
+        memory = int(limits.get("memory") or 0) // (1024 * 1024)
+        nano_cpus = int(limits.get("nano_cpus") or 0)
+        cpu_quota = int(limits.get("cpu_quota") or 0)
+        cpu_period = int(limits.get("cpu_period") or 0)
+        if nano_cpus:
+            cpus = f"{nano_cpus / 1_000_000_000:.2f}"
+        elif cpu_quota > 0 and cpu_period > 0:
+            cpus = f"{cpu_quota / cpu_period:.2f}"
+        else:
+            cpus = "unlimited"
+        await interaction.followup.send(
+            "Docker-enforced limits:\n"
+            f"- Memory: `{memory} MiB`\n"
+            f"- CPUs: `{cpus}`\n"
+            f"- PIDs: `{limits.get('pids_limit') or 'unlimited'}`\n"
+            f"- Disk: `{limits.get('disk') or 'unset'}`\n"
+            f"```\n{_truncate(cgroup_text, 1200)}\n```\n"
+            "`/proc/meminfo` and `nproc` show host-wide values in Docker; the "
+            "cgroup lines above are the limits that actually apply.",
+            ephemeral=True,
+        )
 
     @app_commands.command(name="status", description="Show your container status (use in your control thread).")
     @app_commands.guild_only()

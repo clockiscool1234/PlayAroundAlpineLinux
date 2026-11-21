@@ -36,6 +36,8 @@ class AlpineBot(commands.Bot):
             pids_limit=config.container_pids_limit,
             network_mode=config.container_network,
             http_proxy=config.container_http_proxy,
+            lxcfs_path=config.container_lxcfs_path,
+            tmate=config.tmate,
         )
 
     async def setup_hook(self) -> None:

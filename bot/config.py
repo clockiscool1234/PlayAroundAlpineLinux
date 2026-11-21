@@ -7,6 +7,8 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
+from .tmate import TmateSettings
+
 load_dotenv()
 
 
@@ -138,8 +140,10 @@ class Config:
     container_network_enabled: bool
     container_network: str
     container_http_proxy: str
+    container_lxcfs_path: str
     database_path: Path
     user_defaults: UserSettingsDefaults = field(default_factory=UserSettingsDefaults)
+    tmate: TmateSettings = field(default_factory=TmateSettings)
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -182,6 +186,20 @@ class Config:
             container_network_enabled=network_enabled,
             container_network=network,
             container_http_proxy=http_proxy,
+            container_lxcfs_path=os.getenv(
+                "CONTAINER_LXCFS_PATH", ""
+            ).strip(),
             database_path=db_path,
             user_defaults=UserSettingsDefaults.from_toml(defaults_path),
+            tmate=TmateSettings(
+                server_host=os.getenv("TMATE_SERVER_HOST", "").strip(),
+                server_port=_get_int("TMATE_SERVER_PORT", 22),
+                keys_path=Path(os.getenv("TMATE_KEYS_PATH", "data/tmate")),
+                rsa_fingerprint=os.getenv(
+                    "TMATE_SERVER_RSA_FINGERPRINT", ""
+                ).strip(),
+                ed25519_fingerprint=os.getenv(
+                    "TMATE_SERVER_ED25519_FINGERPRINT", ""
+                ).strip(),
+            ),
         )

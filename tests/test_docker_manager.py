@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+from unittest import mock
 
 from docker.errors import NotFound
 
@@ -57,9 +58,23 @@ class FakeContainer:
     name = "discord-alpine-123"
     status = "running"
 
-    def __init__(self, storage_size: str = "1g") -> None:
+    def __init__(
+        self,
+        storage_size: str = "1g",
+        memory: int = 512 * 1024 * 1024,
+        nano_cpus: int = 1_000_000_000,
+        pids_limit: int = 128,
+    ) -> None:
         self.restart_timeout = None
-        self.attrs = {"HostConfig": {"StorageOpt": {"size": storage_size}}}
+        self.attrs = {
+            "HostConfig": {
+                "StorageOpt": {"size": storage_size},
+                "Memory": memory,
+                "MemorySwap": memory,
+                "NanoCpus": nano_cpus,
+                "PidsLimit": pids_limit,
+            }
+        }
 
     def reload(self):
         return None
@@ -152,6 +167,20 @@ class DockerManagerTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertTrue(client.containers.probe.removed)
 
+    async def test_lxcfs_mounts_are_added_when_configured(self) -> None:
+        manager, client = self.manager()
+        manager.lxcfs_path = "/var/lib/lxcfs"
+        await manager.create_container(guild_id=5, user_id=123)
+
+        volumes = client.containers.run_kwargs["volumes"]
+        self.assertEqual(
+            volumes["/var/lib/lxcfs/proc/meminfo"]["bind"], "/proc/meminfo"
+        )
+        self.assertEqual(
+            volumes["/var/lib/lxcfs/proc/cpuinfo"]["bind"], "/proc/cpuinfo"
+        )
+        self.assertEqual(volumes["/var/lib/lxcfs/proc/meminfo"]["mode"], "ro")
+
     async def test_disk_quota_rejects_non_xfs_overlay(self) -> None:
         manager, client = self.manager()
         client.info_data = {
@@ -211,6 +240,18 @@ class DockerManagerTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(RuntimeError, "without the requested"):
             await manager.create_container(guild_id=5, user_id=123)
 
+    async def test_create_rejects_container_without_requested_limits(self) -> None:
+        manager, client = self.manager()
+        container = FakeContainer(memory=0)
+        client.containers.container_result = container
+        removed = []
+        container.remove = lambda force=False: removed.append(force)  # type: ignore[method-assign]
+
+        with self.assertRaisesRegex(RuntimeError, "memory/CPU/PID limits"):
+            await manager.create_container(guild_id=5, user_id=123)
+
+        self.assertEqual(removed, [True])
+
     async def test_terminal_uses_requested_pty_size(self) -> None:
         manager, client = self.manager()
         client.containers.container = FakeContainer()
@@ -230,6 +271,48 @@ class DockerManagerTests(unittest.IsolatedAsyncioTestCase):
         command = client.api.create_args[1]
         self.assertIn("cat /etc/motd", command[2])
         self.assertIn("exec /bin/sh -l", command[2])
+
+    async def test_container_limits_reads_host_config(self) -> None:
+        manager, client = self.manager()
+        client.containers.container = FakeContainer()
+
+        limits = await manager.container_limits("container-id")
+
+        self.assertEqual(limits["memory"], 512 * 1024 * 1024)
+        self.assertEqual(limits["nano_cpus"], 1_000_000_000)
+        self.assertEqual(limits["pids_limit"], 128)
+        self.assertEqual(limits["disk"], "1g")
+
+    async def test_tmate_requires_networking(self) -> None:
+        manager, _ = self.manager()
+        manager.tmate = manager.tmate.__class__(
+            server_host="tmate",
+            ed25519_fingerprint="SHA256:" + "a" * 43,
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "needs container networking"):
+            await manager.tmate_session("container-id")
+
+    async def test_tmate_is_disabled_without_relay_config(self) -> None:
+        manager, _ = self.manager()
+        manager.network_mode = "alpine-filtered"
+
+        with self.assertRaisesRegex(RuntimeError, "tmate is not configured"):
+            await manager.tmate_session("container-id")
+
+    async def test_tmate_returns_ssh_command(self) -> None:
+        manager, _ = self.manager()
+        manager.network_mode = "alpine-filtered"
+        manager.tmate = manager.tmate.__class__(
+            server_host="tmate",
+            server_port=2222,
+            ed25519_fingerprint="SHA256:" + "a" * 43,
+        )
+        manager.run_command = mock.AsyncMock(return_value=b"ssh abc@tmate\n")
+
+        output = await manager.tmate_session("container-id")
+
+        self.assertEqual(output, "ssh abc@tmate")
 
     async def test_restart_container(self) -> None:
         manager, client = self.manager()

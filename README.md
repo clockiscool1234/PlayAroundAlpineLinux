@@ -21,6 +21,8 @@ This is an initial implementation designed to be extended as requirements become
   - `/showxorg`
   - `/showtty`
   - `/printtty`
+  - `/tmate [stop]`
+  - `/limits`
   - `/status`
   - `/start`
   - `/stop`
@@ -32,6 +34,8 @@ This is an initial implementation designed to be extended as requirements become
 - 1 GiB writable-layer disk quota; creation fails if Docker cannot enforce it.
 - One-CPU execution ceiling.
 - 128-process limit.
+- Optional tmate relay so the owner can `ssh` into their container from another machine.
+- `/limits` reports the cgroup values Docker actually enforces (`free` and `nproc` show host totals in containers).
 - Filtered HTTP/HTTPS access through an internal-only Docker network and Squid policy proxy.
 - All Linux capabilities dropped, `no-new-privileges` enabled, and Docker's default seccomp profile retained.
 - Terminal dimensions are bounded so the visible screen always fits in one Discord message.
@@ -77,6 +81,71 @@ Only the container owner can operate its terminal buttons. Discord is not a low-
 The TTY remains attached until its configured inactivity timeout, an explicit stop, or a bot restart. The next input opens a fresh shell in the same container; container files remain, but a foreground interactive program from the old TTY should be considered disconnected.
 
 Every fresh TTY prints the container's current `/etc/motd`. This includes a TTY opened after its inactivity timeout and the fresh TTY opened by `/restart`.
+
+### SSH access with tmate
+
+The public `tmate.io` relay was shut down in 2025, so this project ships an optional self-hosted relay instead of relying on the hosted service. `user-image` builds tmate 2.4.0 from source; `compose.tmate.yaml` runs `tmate-ssh-server`.
+
+1. Set the address users can reach in `.env`:
+
+```dotenv
+TMATE_SSH_HOST=your-host.example.com
+TMATE_SSH_PORT=2222
+TMATE_PUBLISH_PORT=2222
+```
+
+`TMATE_SSH_HOST` may be a DNS name or IP. If the host is behind NAT, forward `TMATE_PUBLISH_PORT` from your router to the host first. `TMATE_SSH_PORT` is the port advertised in the `ssh` command; change it only when the external and published ports differ.
+
+2. Start the stack with the tmate overlay:
+
+```bash
+docker compose -f compose.yaml -f compose.tmate.yaml up -d --build
+```
+
+The overlay generates the relay's RSA and Ed25519 host keys in `data/tmate/` on first start. The bot reads their SHA256 fingerprints and pins them in each tmate client, so the client refuses a relay with the wrong host key.
+
+3. In the control thread, run `/tmate`. The reply is ephemeral and contains a command such as:
+
+```
+ssh abcdef123@your-host.example.com -p 2222
+```
+
+Run `/tmate stop:true` to close the session. The SSH shell runs as `root` inside the user's own container, so it sees the same files, network policy, and memory/CPU/PID limits as the Discord TTY.
+
+The relay requires `SYS_ADMIN` to create an isolated namespace for each session, so this overlay is optional. Only enable it if you need SSH access. Anyone who obtains the tmate command gets a root shell in that container; keep it private. The relay itself is published on the host, so restrict the port with your firewall if possible.
+
+To use a different tmate-ssh-server, set `TMATE_SERVER_HOST`, `TMATE_SERVER_PORT`, and `TMATE_SERVER_RSA_FINGERPRINT`/`TMATE_SERVER_ED25519_FINGERPRINT` in `.env` and skip `compose.tmate.yaml`. Containers created before the tmate-enabled image was built must be recreated with `/destroycontainer` and `/givcontainerpls`.
+
+### Container limits are enforced, but guest tools show host totals
+
+Docker enforces `CONTAINER_MEMORY`, `CONTAINER_CPUS`, `CONTAINER_PIDS_LIMIT`, and `CONTAINER_DISK` through cgroups and the storage driver. Linux containers still share the host's `/proc`, so `free`, `fastfetch`, `/proc/meminfo`, and `nproc` report host-wide memory and CPU counts even when the container is limited. This is not a missing limit.
+
+Use `/limits` to read the authoritative values:
+
+```
+Docker-enforced limits:
+- Memory: 512 MiB
+- CPUs: 1.00
+- PIDs: 128
+- Disk: 1g
+cgroup memory.max: 536870912
+cgroup cpu.max: 100000 100000
+cgroup pids.max: 128
+```
+
+On cgroup v1 the command reads `memory.limit_in_bytes` and `cpu.cfs_quota_us`/`cpu.cfs_period_us` instead. `cgroup memory.max: max` would mean no limit, which the bot does not create.
+
+If you want `/proc` inside the container to show the limited values too, install `lxcfs` on the host and point `CONTAINER_LXCFS_PATH` at its mount:
+
+```bash
+sudo apt install lxcfs
+sudo systemctl enable --now lxcfs
+
+# .env
+CONTAINER_LXCFS_PATH=/var/lib/lxcfs
+```
+
+The bot then bind-mounts `/var/lib/lxcfs/proc/meminfo` and `/var/lib/lxcfs/proc/cpuinfo` over `/proc/meminfo` and `/proc/cpuinfo`. Recreate existing containers to apply it. lxcfs is optional; Docker's cgroup limits apply with or without it.
 
 ### Container data persistence
 
@@ -175,6 +244,8 @@ For another WireGuard provider, save its generated config under the same `proton
 Docker isolation is not equivalent to a dedicated VM and should not be treated as a perfect hostile multi-tenant sandbox. Run this on a dedicated machine/VM, keep Docker and the kernel patched, and do not store secrets on that host. Mounting `/var/run/docker.sock` gives the **bot process** host-level Docker control, so protect the bot token and its host carefully.
 
 User containers do not receive the Docker socket, host directories, extra capabilities, or a direct Internet route.
+
+`compose.tmate.yaml` is optional and adds a relay with `SYS_ADMIN` plus a published SSH port. Anyone with a `/tmate` command can log in as root inside that one container, and the port is reachable by anyone unless your firewall restricts it. Leave the overlay off when SSH access is not needed.
 
 ## Filtered network access
 
@@ -373,6 +444,12 @@ To add the optional WireGuard egress, use the two-file Compose command described
 docker compose -f compose.yaml -f compose.vpn.yaml up -d --build
 ```
 
+To add the optional self-hosted tmate relay described in **SSH access with tmate**:
+
+```bash
+docker compose -f compose.yaml -f compose.tmate.yaml up -d --build
+```
+
 ## Configuration
 
 | Variable | Default | Meaning |
@@ -384,11 +461,20 @@ docker compose -f compose.yaml -f compose.vpn.yaml up -d --build
 | `CONTAINER_DISK` | `1g` | Hard writable-layer quota; creation is refused unless the daemon's quota probe succeeds |
 | `CONTAINER_CPUS` | `1.0` | Maximum CPU cores available to a user container |
 | `CONTAINER_PIDS_LIMIT` | `128` | Maximum processes per container |
+| `CONTAINER_LXCFS_PATH` | unset | Optional host lxcfs path (`/var/lib/lxcfs`) so guest tools see container memory/CPU limits |
 | `CONTAINER_NETWORK_ENABLED` | `true` | Set to `false` to run user containers with no Docker network and no proxy variables |
 | `CONTAINER_NETWORK` | `alpine-filtered` | Internal Docker network created by Compose (ignored when networking is disabled) |
 | `CONTAINER_HTTP_PROXY` | `http://172.30.0.2:3128` | Filtering proxy injected into user containers (ignored when networking is disabled) |
 | `DATABASE_PATH` | `data/bot.db` | SQLite database path |
 | `USER_DEFAULTS_PATH` | `config/user-defaults.toml` | TOML defaults copied into each new user's settings |
+| `TMATE_SSH_HOST` | unset | Public hostname or IP advertised by the self-hosted tmate relay |
+| `TMATE_SSH_PORT` | `2222` | Externally reachable SSH port advertised to users |
+| `TMATE_PUBLISH_PORT` | `2222` | Host port mapped to the relay's internal port 2222 |
+| `TMATE_SERVER_HOST` | unset | Relay address used by the client inside user containers (set to `tmate` by `compose.tmate.yaml`) |
+| `TMATE_SERVER_PORT` | `22` | Relay SSH port used by the client (`2222` with `compose.tmate.yaml`) |
+| `TMATE_KEYS_PATH` | `data/tmate` | Directory containing the relay's `ssh_host_*_key.pub` files |
+| `TMATE_SERVER_RSA_FINGERPRINT` | unset | Optional explicit relay RSA fingerprint |
+| `TMATE_SERVER_ED25519_FINGERPRINT` | unset | Optional explicit relay Ed25519 fingerprint |
 
 To completely disable networking for user containers, set this in `.env`:
 
@@ -446,12 +532,15 @@ bot/db.py                Async SQLite persistence
 bot/docker_manager.py    Container lifecycle and command execution
 bot/terminal.py          Persistent TTY, ANSI screen renderer, and key input
 bot/xorg.py              Xvfb screenshot renderer and GUI input controls
+bot/tmate.py             tmate relay config, host-key pinning, session commands
 bot/cogs/container.py    Discord slash commands and ownership checks
 bot/main.py              Bot startup and command synchronization
 config/user-defaults.toml  Initial per-user terminal settings
 user-image/              Alpine user image with Xvfb/Openbox/xterm
 compose.vpn.yaml         Optional Gluetun/WireGuard egress override
+compose.tmate.yaml       Optional self-hosted tmate SSH relay
 protonvpn.conf.example   ProtonVPN WireGuard config template (copy to protonvpn.conf)
+tmate/                   Key generator for the self-hosted tmate relay
 vpn-proxy.env.example    Internal Squid-to-Gluetun proxy credentials template
 network-filter/          Squid policy proxy and blocklist generator
 blocklists/              Pinned upstream Git submodules

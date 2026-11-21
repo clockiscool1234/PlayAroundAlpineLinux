@@ -8,7 +8,10 @@ from typing import Any, Optional
 
 import docker
 from docker.errors import ImageNotFound, NotFound
+from docker.utils import parse_bytes
 from docker.models.containers import Container
+
+from .tmate import TmateSettings, build_command
 
 log = logging.getLogger(__name__)
 
@@ -30,6 +33,8 @@ class DockerManager:
         pids_limit: int,
         network_mode: str,
         http_proxy: str,
+        lxcfs_path: str = "",
+        tmate: TmateSettings | None = None,
     ) -> None:
         self.image = image
         self.memory = memory
@@ -38,6 +43,8 @@ class DockerManager:
         self.pids_limit = pids_limit
         self.network_mode = network_mode
         self.http_proxy = http_proxy
+        self.lxcfs_path = lxcfs_path.strip()
+        self.tmate = tmate or TmateSettings()
         self._client: Optional[docker.DockerClient] = None
         self._disk_quota_lock = asyncio.Lock()
         self._disk_quota_checked = False
@@ -256,6 +263,20 @@ class DockerManager:
                 environment=self._container_environment(),
                 restart_policy={"Name": "unless-stopped"},
             )
+            if self.lxcfs_path:
+                # lxcfs makes guest tools such as fastfetch report the
+                # container's memory and CPU limits instead of host totals.
+                base = self.lxcfs_path.rstrip("/")
+                kwargs["volumes"] = {
+                    f"{base}/proc/meminfo": {
+                        "bind": "/proc/meminfo",
+                        "mode": "ro",
+                    },
+                    f"{base}/proc/cpuinfo": {
+                        "bind": "/proc/cpuinfo",
+                        "mode": "ro",
+                    },
+                }
 
             # Fail closed: an unsupported quota must not result in an unlimited
             # writable layer. overlay2 typically requires XFS with project quotas.
@@ -266,7 +287,8 @@ class DockerManager:
                 storage_opt={"size": self.disk},
             )
             attrs = getattr(container, "attrs", {}) or {}
-            storage_opt = (attrs.get("HostConfig") or {}).get("StorageOpt") or {}
+            host_config = attrs.get("HostConfig") or {}
+            storage_opt = host_config.get("StorageOpt") or {}
             actual = storage_opt.get("size")
             if (actual or "").lower() != self.disk.lower():
                 try:
@@ -279,6 +301,31 @@ class DockerManager:
                 raise RuntimeError(
                     "Docker created the user container without the requested "
                     f"disk quota (requested {self.disk!r}, got {actual!r})."
+                )
+
+            expected_memory = parse_bytes(self.memory)
+            expected_nano_cpus = int(self.cpus * 1_000_000_000)
+            actual_memory = host_config.get("Memory")
+            actual_nano_cpus = host_config.get("NanoCpus")
+            actual_pids = host_config.get("PidsLimit")
+            if (
+                actual_memory != expected_memory
+                or actual_nano_cpus != expected_nano_cpus
+                or actual_pids != self.pids_limit
+            ):
+                try:
+                    container.remove(force=True)
+                except Exception:
+                    log.warning(
+                        "Failed to remove container without resource limits: %s",
+                        getattr(container, "id", "unknown"),
+                    )
+                raise RuntimeError(
+                    "Docker created the user container without the requested "
+                    "memory/CPU/PID limits "
+                    f"(wanted memory={expected_memory}, nano_cpus={expected_nano_cpus}, "
+                    f"pids={self.pids_limit}; got memory={actual_memory}, "
+                    f"nano_cpus={actual_nano_cpus}, pids={actual_pids})."
                 )
             return container
 
@@ -466,6 +513,48 @@ class DockerManager:
             return output
 
         return await asyncio.to_thread(_run)
+
+    async def tmate_session(self, container_id: str, *, stop: bool = False) -> str:
+        """Start or stop the user's tmate relay session and return the SSH command."""
+        if not stop and self.network_mode == "none":
+            raise RuntimeError(
+                "tmate needs container networking. Set "
+                "CONTAINER_NETWORK_ENABLED=true and recreate the container."
+            )
+        if not stop and not self.tmate.server_host:
+            raise RuntimeError(
+                "tmate is not configured on this bot. Start the stack with "
+                "compose.tmate.yaml or set TMATE_SERVER_HOST and the relay "
+                "host-key fingerprints."
+            )
+        output = await self.run_command(
+            container_id,
+            build_command(self.tmate, stop=stop),
+            max_output=64 * 1024,
+        )
+        return output.decode("utf-8", errors="replace").strip()
+
+    async def container_limits(self, container_id: str) -> dict[str, Any]:
+        """Return the limits Docker actually recorded for a container."""
+        container = await self.get_container(container_id)
+        if container is None:
+            raise RuntimeError("Container not found")
+
+        def _read() -> dict[str, Any]:
+            container.reload()
+            host = (getattr(container, "attrs", {}) or {}).get("HostConfig") or {}
+            storage = host.get("StorageOpt") or {}
+            return {
+                "memory": host.get("Memory") or 0,
+                "memory_swap": host.get("MemorySwap") or 0,
+                "nano_cpus": host.get("NanoCpus") or 0,
+                "cpu_quota": host.get("CpuQuota") or 0,
+                "cpu_period": host.get("CpuPeriod") or 0,
+                "pids_limit": host.get("PidsLimit") or 0,
+                "disk": storage.get("size") or "",
+            }
+
+        return await asyncio.to_thread(_read)
 
     async def ensure_xorg(self, container_id: str) -> None:
         script = r"""

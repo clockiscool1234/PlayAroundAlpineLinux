@@ -103,6 +103,28 @@ class ConfigNetworkTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "must be true or false"):
             self.load(CONTAINER_NETWORK_ENABLED="sometimes")
 
+    def test_lxcfs_path_is_optional(self) -> None:
+        self.assertEqual(self.load().container_lxcfs_path, "")
+        self.assertEqual(
+            self.load(CONTAINER_LXCFS_PATH="/var/lib/lxcfs").container_lxcfs_path,
+            "/var/lib/lxcfs",
+        )
+
+    def test_tmate_settings_are_loaded(self) -> None:
+        fingerprint = "SHA256:" + "a" * 43
+        config = self.load(
+            TMATE_SERVER_HOST="relay.example",
+            TMATE_SERVER_PORT="2222",
+            TMATE_KEYS_PATH="/tmp/tmate-keys",
+            TMATE_SERVER_ED25519_FINGERPRINT=fingerprint,
+        )
+
+        self.assertEqual(config.tmate.server_host, "relay.example")
+        self.assertEqual(config.tmate.server_port, 2222)
+        self.assertEqual(str(config.tmate.keys_path), "/tmp/tmate-keys")
+        self.assertEqual(config.tmate.ed25519_fingerprint, fingerprint)
+        self.assertTrue(config.tmate.configured)
+
 
 if __name__ == "__main__":
     unittest.main()

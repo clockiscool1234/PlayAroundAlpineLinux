@@ -13,3 +13,7 @@ data/*
 *.db
 *.log
 .DS_Store
+
+# Local agent context dumps and editor backups. *~ matches this repo's
+# context~ directory as well as Emacs-style backup files.
+*~
